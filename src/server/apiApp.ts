@@ -192,9 +192,19 @@ function decryptCredentialPayload(
 }
 
 function getBlobToken(): string {
-  const token = (process.env.BLOB_READ_WRITE_TOKEN || '').trim();
-  if (!token || token === 'MY_BLOB_TOKEN') return '';
-  return token;
+  const direct = (
+    process.env.BLOB_READ_WRITE_TOKEN ||
+    process.env.TAPHOADUNGCANH_BLOB_READ_WRITE_TOKEN ||
+    ''
+  ).trim();
+  if (direct && direct !== 'MY_BLOB_TOKEN') return direct;
+
+  for (const val of Object.values(process.env)) {
+    if (typeof val === 'string' && val.trim().startsWith('vercel_blob_rw_')) {
+      return val.trim();
+    }
+  }
+  return '';
 }
 
 async function readStreamToString(
@@ -241,15 +251,16 @@ async function loadBlobDatabase(
   const token = getBlobToken();
   const now = Date.now();
 
-  if (cachedDb && !forceRefresh && now - lastBlobFetchMs < 4000) {
+  if (cachedDb && !forceRefresh && now - lastBlobFetchMs < 1500) {
     return cachedDb;
   }
 
-  // 1. Try reading from Private Vercel Blob Store (taphoadungcanh-blob/database.json) via get(..., { access: 'private' })
+  // 1. Read from Vercel Blob Store (taphoadungcanh-blob/database.json)
   if (token) {
     try {
       let rawText: string | null = null;
 
+      // Step 1a: Try direct private get with useCache: false
       try {
         const privateRes = await get(BLOB_PATHNAME, {
           access: 'private',
@@ -264,33 +275,63 @@ async function loadBlobDatabase(
           rawText = await readStreamToString(privateRes.stream);
         }
       } catch {
-        // Fallback to list + get in case pathname has a suffix or public access
-        const { blobs } = await list({
-          prefix: BLOB_PATHNAME,
-          token,
-          limit: 5,
-        });
-        if (blobs && blobs.length > 0) {
-          const sorted = [...blobs].sort(
-            (a, b) =>
-              new Date(b.uploadedAt).getTime() -
-              new Date(a.uploadedAt).getTime()
-          );
-          const latestBlob = sorted[0];
-          const byUrl = await get(latestBlob.url, {
-            access: 'private',
+        // Proceed to public / list fallback
+      }
+
+      // Step 1b: Note that @vercel/blob get() returns null on 404 without throwing!
+      // If private get returned null or threw, try direct public get:
+      if (!rawText) {
+        try {
+          const publicRes = await get(BLOB_PATHNAME, {
+            access: 'public',
             useCache: false,
             token,
-          }).catch(() =>
-            get(latestBlob.url, {
-              access: 'public',
+          });
+          if (
+            publicRes &&
+            publicRes.statusCode === 200 &&
+            publicRes.stream
+          ) {
+            rawText = await readStreamToString(publicRes.stream);
+          }
+        } catch {
+          // Proceed to list() fallback
+        }
+      }
+
+      // Step 1c: If still not found by pathname, query list() metadata API (never edge-cached)
+      if (!rawText) {
+        try {
+          const { blobs } = await list({
+            prefix: BLOB_PATHNAME,
+            token,
+            limit: 10,
+          });
+          if (blobs && blobs.length > 0) {
+            const sorted = [...blobs].sort(
+              (a, b) =>
+                new Date(b.uploadedAt).getTime() -
+                new Date(a.uploadedAt).getTime()
+            );
+            const latestBlob = sorted[0];
+            const isPrivateUrl = latestBlob.url.includes('.private.blob.');
+            const byUrl = await get(latestBlob.url, {
+              access: isPrivateUrl ? 'private' : 'public',
               useCache: false,
               token,
-            })
-          );
-          if (byUrl && byUrl.statusCode === 200 && byUrl.stream) {
-            rawText = await readStreamToString(byUrl.stream);
+            }).catch(() =>
+              get(latestBlob.url, {
+                access: isPrivateUrl ? 'public' : 'private',
+                useCache: false,
+                token,
+              })
+            );
+            if (byUrl && byUrl.statusCode === 200 && byUrl.stream) {
+              rawText = await readStreamToString(byUrl.stream);
+            }
           }
+        } catch {
+          // Ignore list error
         }
       }
 
@@ -337,6 +378,14 @@ async function loadBlobDatabase(
         invoices: Array.isArray(parsed.invoices) ? parsed.invoices : [],
       };
       lastBlobFetchMs = now;
+      // If token is present and Blob Store was empty, seed initial snapshot to Vercel Blob automatically
+      if (token) {
+        putBlobWithPrivateFirst(
+          BLOB_PATHNAME,
+          JSON.stringify(cachedDb, null, 2),
+          token
+        ).catch(() => {});
+      }
       return cachedDb;
     }
   } catch {
@@ -579,6 +628,15 @@ async function queryOpenFactsRegistry(
 export function createApiRouter() {
   const router = express.Router();
   router.use(express.json({ limit: '15mb' }));
+  router.use('/api/db', (_req, res, next) => {
+    res.setHeader(
+      'Cache-Control',
+      'no-store, no-cache, must-revalidate, proxy-revalidate'
+    );
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    next();
+  });
 
   // 1. Auth & Blob Store Connection Status
   router.get('/api/auth/status', async (_req, res) => {
@@ -714,10 +772,9 @@ export function createApiRouter() {
   });
 
   // 4. Read Entire Database State from Vercel Blob Store (taphoadungcanh-blob)
-  router.get('/api/db/state', requireAuth, async (req, res) => {
+  router.get('/api/db/state', requireAuth, async (_req, res) => {
     try {
-      const force = req.query.refresh === '1';
-      const dbData = await loadBlobDatabase(force);
+      const dbData = await loadBlobDatabase(true);
       return res.json({
         storeId: dbData.storeId,
         updatedAtIso: dbData.updatedAtIso,
@@ -756,7 +813,7 @@ export function createApiRouter() {
           .json({ error: 'Mã vạch và tên sản phẩm không được để trống.' });
       }
 
-      const dbData = await loadBlobDatabase();
+      const dbData = await loadBlobDatabase(true);
       const record: BlobProductRecord = {
         id: `blob_prod_${cleanBarcode}`,
         barcode: cleanBarcode,
@@ -800,7 +857,7 @@ export function createApiRouter() {
           .json({ error: 'Số lượng sản phẩm đồng bộ mỗi lần từ 1 đến 200 mã.' });
       }
 
-      const dbData = await loadBlobDatabase();
+      const dbData = await loadBlobDatabase(true);
       let count = 0;
       const nowIso = new Date().toISOString();
 
@@ -855,7 +912,7 @@ export function createApiRouter() {
         return res.status(400).json({ error: 'Mã vạch không hợp lệ.' });
       }
 
-      const dbData = await loadBlobDatabase();
+      const dbData = await loadBlobDatabase(true);
       delete dbData.products[cleanBarcode];
       dbData.deletedBarcodes[cleanBarcode] = true;
 
@@ -886,7 +943,7 @@ export function createApiRouter() {
         return res.status(400).json({ error: 'Thiếu mã hóa đơn.' });
       }
 
-      const dbData = await loadBlobDatabase();
+      const dbData = await loadBlobDatabase(true);
       const nowIso = new Date().toISOString();
       const newInvoice: BlobInvoiceRecord = {
         id: `inv_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -964,7 +1021,7 @@ export function createApiRouter() {
   router.delete('/api/db/invoices/:id', requireAuth, async (req, res) => {
     try {
       const targetId = String(req.params.id || '').trim();
-      const dbData = await loadBlobDatabase();
+      const dbData = await loadBlobDatabase(true);
       dbData.invoices = dbData.invoices.filter((inv) => inv.id !== targetId);
       const saveRes = await saveBlobDatabase(dbData);
       return res.json({
@@ -986,7 +1043,7 @@ export function createApiRouter() {
     try {
       const targetId = String(req.params.id || '').trim();
       const body = req.body || {};
-      const dbData = await loadBlobDatabase();
+      const dbData = await loadBlobDatabase(true);
       const idx = dbData.invoices.findIndex((inv) => inv.id === targetId);
       if (idx === -1) {
         return res
@@ -1324,7 +1381,7 @@ export function createApiRouter() {
   router.put('/api/db/profile', requireAuth, async (req, res) => {
     try {
       const body = req.body || {};
-      const dbData = await loadBlobDatabase();
+      const dbData = await loadBlobDatabase(true);
       dbData.storeProfile = {
         storeName: String(
           body.storeName || dbData.storeProfile.storeName

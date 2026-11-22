@@ -351,15 +351,20 @@ export default function App() {
   } | null>(null);
 
   const scannerInputRef = useRef<HTMLInputElement>(null);
+  const lastAppliedServerIsoRef = useRef<string>('');
+  const isApplyingRemoteStateRef = useRef<boolean>(false);
+  const hasCompletedInitialFetchRef = useRef<boolean>(false);
 
-  // 1. Fetch Database State directly from shared Vercel Blob Store (taphoadungcanh-blob) on Mount
+  // 1. Fetch Database State directly from shared Vercel Blob Store (taphoadungcanh-blob)
   const fetchBlobDatabaseState = async (
     _tokenToUse?: string,
-    forceRefresh = false
+    forceRefresh = false,
+    isBackgroundPoll = false
   ) => {
     try {
       const res = await fetch(
-        `/api/db/state${forceRefresh ? '?refresh=1' : ''}`
+        `/api/db/state?refresh=${forceRefresh ? '1' : '0'}&t=${Date.now()}`,
+        { cache: 'no-store' }
       );
       if (!res.ok) return;
       const data = await parseApiJson(res);
@@ -371,7 +376,22 @@ export default function App() {
       // If the serverless container cold-started without persisted Blob data (hasPersistedData === false),
       // do NOT overwrite the browser's saved localStorage state on F5 reload!
       if (!data?.hasPersistedData) {
+        hasCompletedInitialFetchRef.current = true;
         return;
+      }
+
+      const incomingIso = String(data?.updatedAtIso || '');
+      if (
+        isBackgroundPoll &&
+        incomingIso &&
+        incomingIso === lastAppliedServerIsoRef.current
+      ) {
+        return;
+      }
+
+      isApplyingRemoteStateRef.current = true;
+      if (incomingIso) {
+        lastAppliedServerIsoRef.current = incomingIso;
       }
 
       if (data?.storeProfile) {
@@ -491,18 +511,105 @@ export default function App() {
       ) {
         setCurrentInvoiceCode(data.currentInvoiceCode.trim());
       }
-    } catch (error) {
-      setAuthError(
-        error instanceof Error
-          ? error.message
-          : 'Không thể đồng bộ dữ liệu từ taphoadungcanh-blob.'
-      );
+
+      hasCompletedInitialFetchRef.current = true;
+      setTimeout(() => {
+        isApplyingRemoteStateRef.current = false;
+      }, 150);
+    } catch {
+      hasCompletedInitialFetchRef.current = true;
+      isApplyingRemoteStateRef.current = false;
     }
   };
 
+  // Auto-pull from taphoadungcanh-blob on mount, on tab focus, and every 4 seconds
   useEffect(() => {
-    fetchBlobDatabaseState(undefined, true);
+    fetchBlobDatabaseState(undefined, true, false);
+
+    const onFocusOrVisible = () => {
+      if (document.visibilityState === 'visible') {
+        fetchBlobDatabaseState(undefined, true, true);
+      }
+    };
+    window.addEventListener('focus', onFocusOrVisible);
+    document.addEventListener('visibilitychange', onFocusOrVisible);
+
+    const pollTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        fetchBlobDatabaseState(undefined, true, true);
+      }
+    }, 4000);
+
+    return () => {
+      window.removeEventListener('focus', onFocusOrVisible);
+      document.removeEventListener('visibilitychange', onFocusOrVisible);
+      window.clearInterval(pollTimer);
+    };
   }, []);
+
+  // Auto-push any local state changes (bills, items, QR profile, products, history) to taphoadungcanh-blob
+  useEffect(() => {
+    if (!hasCompletedInitialFetchRef.current || isApplyingRemoteStateRef.current) {
+      return;
+    }
+    const syncTimer = window.setTimeout(async () => {
+      if (isApplyingRemoteStateRef.current) return;
+      try {
+        const compactProducts = filterModifiedOrCustomProducts(dbProducts);
+        const res = await fetch('/api/db/restore-or-update', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
+          },
+          body: JSON.stringify({
+            replaceMode: true,
+            snapshot: {
+              storeProfile,
+              products: compactProducts,
+              deletedBarcodes,
+              orderTabs,
+              activeTabId,
+              currentInvoiceCode,
+              invoices: invoices.map((inv) => ({
+                id: inv.id,
+                invoiceCode: inv.invoiceCode,
+                tabName: inv.tabName,
+                customerName: inv.customerName,
+                itemsJson: inv.itemsJson,
+                itemCount: inv.itemCount,
+                subtotal: inv.subtotal,
+                discount: inv.discount,
+                totalAmount: inv.totalAmount,
+                amountTendered: inv.amountTendered,
+                changeDue: inv.changeDue,
+                paperWidth: inv.paperWidth,
+                createdAtIso: inv.createdAtDate
+                  ? inv.createdAtDate.toISOString()
+                  : new Date().toISOString(),
+              })),
+            },
+          }),
+        });
+        const data = await parseApiJson(res);
+        if (res.ok && data?.updatedAtIso) {
+          lastAppliedServerIsoRef.current = String(data.updatedAtIso);
+        }
+      } catch {
+        // Ignore background auto-sync error
+      }
+    }, 700);
+
+    return () => window.clearTimeout(syncTimer);
+  }, [
+    storeProfile,
+    dbProducts,
+    deletedBarcodes,
+    invoices,
+    orderTabs,
+    activeTabId,
+    currentInvoiceCode,
+  ]);
 
   // Save Store Profile & Bank QR Configuration to Vercel Blob Store
   const handleSaveProfileToBlobStore = async (
