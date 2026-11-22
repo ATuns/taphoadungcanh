@@ -136,8 +136,34 @@ export default function App() {
   const [authError, setAuthError] = useState<string>('');
   const [blobSyncNotice, setBlobSyncNotice] = useState<string>('');
 
-  // Navigation Section
-  const [activeSection, setActiveSection] = useState<ActiveSection>('pos');
+  // Detect mobile viewport so mobile devices show only "Nhập Barcode Tự Động" (with Camera scanner) and "Kho Hàng"
+  const [isMobileDevice, setIsMobileDevice] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return window.innerWidth < 768;
+  });
+
+  // Navigation Section (Default to 'barcode_add' on mobile, 'pos' on desktop)
+  const [activeSection, setActiveSection] = useState<ActiveSection>(() => {
+    if (typeof window !== 'undefined' && window.innerWidth < 768) {
+      return 'barcode_add';
+    }
+    return 'pos';
+  });
+
+  useEffect(() => {
+    const handleResize = () => {
+      const mobile = window.innerWidth < 768;
+      setIsMobileDevice(mobile);
+      if (mobile) {
+        setActiveSection((prev) =>
+          prev === 'pos' || prev === 'invoices' ? 'barcode_add' : prev
+        );
+      }
+    };
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   // Store Profile & Bank QR Settings (Configurable in "Lịch sử bill")
   const [storeProfile, setStoreProfile] = useState<StoreProfile>(() => {
@@ -1983,49 +2009,86 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
-      {/* STRICT 3-ZONE TOP BAR CONTRACT */}
-      <header className="no-print flex items-center justify-between gap-8 px-6 py-3.5 bg-white border-b border-slate-200 sticky top-0 z-30">
-        {/* Zone 1: Single text element wordmark */}
-        <a
-          href="#pos"
-          onClick={(e) => {
-            e.preventDefault();
-            setActiveSection('pos');
-          }}
-          className="text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
-        >
-          Tạp Hóa Dung Cảnh
-        </a>
-
-        {/* Zone 2: 4 concise single-line text navigation links */}
-        <nav className="flex items-center gap-6 text-sm font-medium text-slate-600 overflow-x-auto">
+      {/* STRICT 3-ZONE TOP BAR CONTRACT (Mobile-optimized for Barcode & Inventory) */}
+      <header className="no-print flex flex-col md:flex-row md:items-center md:justify-between gap-2.5 md:gap-8 px-4 md:px-6 py-3 md:py-3.5 bg-white border-b border-slate-200 sticky top-0 z-30">
+        <div className="flex items-center justify-between gap-3">
+          {/* Zone 1: Single text element wordmark */}
           <a
-            href="#pos"
+            href={isMobileDevice ? '#barcode-add' : '#pos'}
             onClick={(e) => {
               e.preventDefault();
-              setActiveSection('pos');
+              setActiveSection(isMobileDevice ? 'barcode_add' : 'pos');
             }}
-            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              activeSection === 'pos'
-                ? 'text-slate-900 font-semibold border-emerald-600'
-                : 'border-transparent hover:text-slate-900'
-            }`}
+            className="text-base md:text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
           >
-            Lên Bill ({orderTabs.length})
+            Tạp Hóa Dung Cảnh
           </a>
+
+          {/* Mobile Action Bar (Visible on mobile right next to brand title) */}
+          <div className="flex md:hidden items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              disabled={isBackupWorking}
+              onClick={handleUpdateSavedDatabaseOnBlob}
+              className="px-2.5 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 cursor-pointer"
+              title={`Kho dữ liệu chung: ${blobStoreId}`}
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${isBackupWorking ? 'animate-spin' : ''}`}
+              />
+              <span>Đồng Bộ</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleAdminLogout}
+              className="p-1.5 text-slate-500 hover:text-red-600 hover:bg-slate-100 rounded-lg transition-colors shrink-0 cursor-pointer"
+              title="Đăng xuất Admin khỏi thiết bị này"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+
+        {/* Zone 2: Navigation links (On Mobile: ONLY "Nhập Barcode Tự Động" & "Kho Hàng") */}
+        <nav className="grid grid-cols-2 md:flex md:items-center gap-2 md:gap-6 text-xs md:text-sm font-medium text-slate-600">
+          {!isMobileDevice && (
+            <a
+              href="#pos"
+              onClick={(e) => {
+                e.preventDefault();
+                setActiveSection('pos');
+              }}
+              className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+                activeSection === 'pos'
+                  ? 'text-slate-900 font-semibold border-emerald-600'
+                  : 'border-transparent hover:text-slate-900'
+              }`}
+            >
+              Lên Bill ({orderTabs.length})
+            </a>
+          )}
           <a
             href="#barcode-add"
             onClick={(e) => {
               e.preventDefault();
               setActiveSection('barcode_add');
             }}
-            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              activeSection === 'barcode_add'
-                ? 'text-slate-900 font-semibold border-emerald-600'
-                : 'border-transparent hover:text-slate-900'
-            }`}
+            className={
+              isMobileDevice
+                ? `py-2 px-3 rounded-xl text-center font-bold transition-colors flex items-center justify-center gap-1.5 ${
+                    activeSection === 'barcode_add'
+                      ? 'bg-emerald-600 text-white shadow-sm'
+                      : 'bg-slate-100 text-slate-700'
+                  }`
+                : `py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+                    activeSection === 'barcode_add'
+                      ? 'text-slate-900 font-semibold border-emerald-600'
+                      : 'border-transparent hover:text-slate-900'
+                  }`
+            }
           >
-            Nhập Barcode Tự Động
+            <Barcode className="w-4 h-4 md:hidden shrink-0" />
+            <span>Nhập Barcode Tự Động</span>
           </a>
           <a
             href="#inventory"
@@ -2033,32 +2096,43 @@ export default function App() {
               e.preventDefault();
               setActiveSection('inventory');
             }}
-            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              activeSection === 'inventory'
-                ? 'text-slate-900 font-semibold border-emerald-600'
-                : 'border-transparent hover:text-slate-900'
-            }`}
+            className={
+              isMobileDevice
+                ? `py-2 px-3 rounded-xl text-center font-bold transition-colors flex items-center justify-center gap-1.5 ${
+                    activeSection === 'inventory'
+                      ? 'bg-emerald-600 text-white shadow-sm'
+                      : 'bg-slate-100 text-slate-700'
+                  }`
+                : `py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+                    activeSection === 'inventory'
+                      ? 'text-slate-900 font-semibold border-emerald-600'
+                      : 'border-transparent hover:text-slate-900'
+                  }`
+            }
           >
-            Kho Hàng ({formatVND(allProducts.length)} mã)
+            <Database className="w-3.5 h-3.5 md:hidden shrink-0" />
+            <span>Kho Hàng ({formatVND(allProducts.length)})</span>
           </a>
-          <a
-            href="#invoices"
-            onClick={(e) => {
-              e.preventDefault();
-              setActiveSection('invoices');
-            }}
-            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              activeSection === 'invoices'
-                ? 'text-slate-900 font-semibold border-emerald-600'
-                : 'border-transparent hover:text-slate-900'
-            }`}
-          >
-            Lịch Sử Bill & Mã QR ({invoices.length})
-          </a>
+          {!isMobileDevice && (
+            <a
+              href="#invoices"
+              onClick={(e) => {
+                e.preventDefault();
+                setActiveSection('invoices');
+              }}
+              className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+                activeSection === 'invoices'
+                  ? 'text-slate-900 font-semibold border-emerald-600'
+                  : 'border-transparent hover:text-slate-900'
+              }`}
+            >
+              Lịch Sử Bill & Mã QR ({invoices.length})
+            </a>
+          )}
         </nav>
 
-        {/* Zone 3: Primary action & Logout */}
-        <div className="flex items-center gap-2 shrink-0">
+        {/* Zone 3: Desktop Primary action & Logout */}
+        <div className="hidden md:flex items-center gap-2 shrink-0">
           <button
             type="button"
             disabled={isBackupWorking}
@@ -2675,6 +2749,7 @@ export default function App() {
               existingProducts={allProducts}
               onSaveProduct={handleSaveProductToBlobStore}
               isEmbedded={true}
+              isMobileMode={isMobileDevice}
             />
           </div>
         )}
@@ -3010,18 +3085,20 @@ export default function App() {
                               </>
                             ) : (
                               <>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    addProductToActiveBill(prod, 1);
-                                    setActiveSection('pos');
-                                  }}
-                                  className="px-2 py-1 text-xs bg-slate-100 hover:bg-emerald-50 hover:text-emerald-800 text-slate-700 rounded flex items-center gap-1 cursor-pointer"
-                                  title="Đưa vào phiếu đang mở"
-                                >
-                                  <ShoppingCart className="w-3 h-3" />
-                                  <span>Đưa vào Bill</span>
-                                </button>
+                                {!isMobileDevice && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      addProductToActiveBill(prod, 1);
+                                      setActiveSection('pos');
+                                    }}
+                                    className="px-2 py-1 text-xs bg-slate-100 hover:bg-emerald-50 hover:text-emerald-800 text-slate-700 rounded flex items-center gap-1 cursor-pointer"
+                                    title="Đưa vào phiếu đang mở"
+                                  >
+                                    <ShoppingCart className="w-3 h-3" />
+                                    <span>Đưa vào Bill</span>
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   onClick={() => {
