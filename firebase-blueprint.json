@@ -1,0 +1,184 @@
+{
+  "entities": {
+    "Product": {
+      "title": "Product",
+      "description": "Grocery product item identified by barcode in Tạp Hóa Dung Cảnh inventory.",
+      "type": "object",
+      "properties": {
+        "barcode": {
+          "type": "string",
+          "description": "EAN/UPC or internal product barcode string.",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the grocery product.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "category": {
+          "type": "string",
+          "description": "Product category in the grocery store.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "unit": {
+          "type": "string",
+          "description": "Measurement or packaging unit (e.g., Gói, Chai, Lon, Hộp).",
+          "minLength": 1,
+          "maxLength": 50
+        },
+        "price": {
+          "type": "number",
+          "description": "Retail selling price in VND."
+        },
+        "costPrice": {
+          "type": "number",
+          "description": "Import cost price in VND."
+        },
+        "stock": {
+          "type": "number",
+          "description": "Current inventory stock quantity."
+        },
+        "source": {
+          "type": "string",
+          "description": "Origin of product lookup (barcode_auto, manual, sample).",
+          "minLength": 1,
+          "maxLength": 50
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the store owner.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when product was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when product was last updated."
+        }
+      },
+      "required": [
+        "barcode",
+        "name",
+        "category",
+        "unit",
+        "price",
+        "costPrice",
+        "stock",
+        "source",
+        "ownerId",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Invoice": {
+      "title": "Invoice",
+      "description": "Completed thermal receipt sales invoice for Tạp Hóa Dung Cảnh.",
+      "type": "object",
+      "properties": {
+        "invoiceCode": {
+          "type": "string",
+          "description": "Human-readable receipt number.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "tabName": {
+          "type": "string",
+          "description": "POS bill tab label.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "customerName": {
+          "type": "string",
+          "description": "Customer name or walk-in note.",
+          "minLength": 1,
+          "maxLength": 150
+        },
+        "itemsJson": {
+          "type": "string",
+          "description": "Serialized line items for thermal receipt printing.",
+          "minLength": 2,
+          "maxLength": 4000
+        },
+        "itemCount": {
+          "type": "number",
+          "description": "Total number of items sold in the receipt."
+        },
+        "subtotal": {
+          "type": "number",
+          "description": "Subtotal before discount in VND."
+        },
+        "discount": {
+          "type": "number",
+          "description": "Discount amount in VND."
+        },
+        "totalAmount": {
+          "type": "number",
+          "description": "Final total payable in VND."
+        },
+        "amountTendered": {
+          "type": "number",
+          "description": "Cash or payment tendered by customer in VND."
+        },
+        "changeDue": {
+          "type": "number",
+          "description": "Change returned to customer in VND."
+        },
+        "paperWidth": {
+          "type": "string",
+          "description": "Thermal paper format (58mm or 80mm).",
+          "minLength": 1,
+          "maxLength": 10
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the store owner.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when invoice was finalized."
+        }
+      },
+      "required": [
+        "invoiceCode",
+        "tabName",
+        "customerName",
+        "itemsJson",
+        "itemCount",
+        "subtotal",
+        "discount",
+        "totalAmount",
+        "amountTendered",
+        "changeDue",
+        "paperWidth",
+        "ownerId",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/products/{productId}": {
+      "schema": {
+        "$ref": "#/entities/Product"
+      },
+      "description": "Store products indexed by document ID and barcode."
+    },
+    "/invoices/{invoiceId}": {
+      "schema": {
+        "$ref": "#/entities/Invoice"
+      },
+      "description": "Completed thermal receipt invoices."
+    }
+  }
+}

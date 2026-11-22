@@ -1,0 +1,2409 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import {
+  onAuthStateChanged,
+  signInWithPopup,
+  signOut,
+  User,
+} from 'firebase/auth';
+import {
+  collection,
+  doc,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  onSnapshot,
+  query,
+  where,
+  serverTimestamp,
+  Timestamp,
+} from 'firebase/firestore';
+import {
+  Barcode,
+  Plus,
+  Trash2,
+  Printer,
+  Search,
+  PackagePlus,
+  LogIn,
+  LogOut,
+  Edit3,
+  Check,
+  X,
+  ShoppingCart,
+  FileText,
+  QrCode,
+  Upload,
+  ChevronLeft,
+  ChevronRight,
+  Database,
+  AlertTriangle,
+} from 'lucide-react';
+import {
+  auth,
+  db,
+  googleProvider,
+  OperationType,
+  handleFirestoreError,
+} from './firebase.ts';
+import {
+  Product,
+  BillLineItem,
+  PosOrderTab,
+  InvoiceRecord,
+  StoreProfile,
+} from './types.ts';
+import {
+  VIETNAM_BARCODE_CATALOG,
+  VIETNAM_MASTER_PRODUCTS_LIST,
+  PRODUCT_CATEGORIES,
+  PRODUCT_UNITS,
+} from './data/vietnamBarcodes.ts';
+import { VIETNAM_BANKS, generateVietQrDataUrl } from './utils/vietqr.ts';
+import { ThermalReceipt, formatVND } from './components/ThermalReceipt.tsx';
+import { BarcodeAutoModal } from './components/BarcodeAutoModal.tsx';
+
+type ActiveSection = 'pos' | 'inventory' | 'barcode_add' | 'invoices';
+
+const INVENTORY_PAGE_SIZE = 50;
+
+function generateInvoiceCode(): string {
+  const now = new Date();
+  const ymd = `${String(now.getFullYear()).slice(-2)}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+  const rand = Math.floor(1000 + Math.random() * 9000);
+  return `DC-${ymd}-${rand}`;
+}
+
+function createEmptyOrderTab(tabNumber: number): PosOrderTab {
+  return {
+    id: `tab_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    tabNumber,
+    label: `Phiếu ${tabNumber}`,
+    customerName: 'Khách lẻ',
+    createdAtIso: new Date().toISOString(),
+    items: [],
+    discount: 0,
+    amountTendered: 0,
+  };
+}
+
+export default function App() {
+  // Authentication & Firestore State
+  const [user, setUser] = useState<User | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [authError, setAuthError] = useState<string>('');
+
+  // Navigation Section
+  const [activeSection, setActiveSection] = useState<ActiveSection>('pos');
+
+  // Store Profile & Bank QR Settings (Configurable in "Lịch sử bill")
+  const [storeProfile, setStoreProfile] = useState<StoreProfile>(() => {
+    const defaultProfile: StoreProfile = {
+      storeName: 'TẠP HÓA DUNG CẢNH',
+      address: 'Khu dân cư trung tâm · Chuyên sỉ & lẻ tạp hóa',
+      phone: '0905 888 999',
+      footerNote: 'Cảm ơn Quý Khách · Hẹn gặp lại!',
+      paperWidth: '80mm',
+      bankBin: '970436',
+      bankShortName: 'VCB',
+      bankAccountNumber: '0123456789',
+      bankAccountName: 'TAP HOA DUNG CANH',
+      bankQrNoteTemplate: 'TT',
+      customQrDataUrl: '',
+    };
+    try {
+      const saved = localStorage.getItem('dung_canh_store_profile');
+      if (saved) {
+        return { ...defaultProfile, ...JSON.parse(saved) };
+      }
+    } catch {
+      // Ignore storage error
+    }
+    return defaultProfile;
+  });
+
+  const [previewQrInSettings, setPreviewQrInSettings] = useState<string>('');
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'dung_canh_store_profile',
+        JSON.stringify(storeProfile)
+      );
+    } catch {
+      // Ignore storage error
+    }
+
+    if (storeProfile.customQrDataUrl) {
+      setPreviewQrInSettings(storeProfile.customQrDataUrl);
+    } else {
+      generateVietQrDataUrl({
+        bankBin: storeProfile.bankBin || '970436',
+        accountNumber: storeProfile.bankAccountNumber || '0123456789',
+        amount: 0,
+        addInfo: storeProfile.bankQrNoteTemplate || 'TAP HOA DUNG CANH',
+      }).then((url) => setPreviewQrInSettings(url));
+    }
+  }, [storeProfile]);
+
+  // Firestore Custom / Edited Products & Invoices
+  const [dbProducts, setDbProducts] = useState<Product[]>([]);
+  const [deletedBarcodes, setDeletedBarcodes] = useState<Record<string, boolean>>(() => {
+    try {
+      const saved = localStorage.getItem('dung_canh_deleted_barcodes');
+      if (saved) return JSON.parse(saved);
+    } catch {
+      // Ignore
+    }
+    return {};
+  });
+
+  const [invoices, setInvoices] = useState<InvoiceRecord[]>([]);
+  const [selectedHistoryInvoice, setSelectedHistoryInvoice] =
+    useState<InvoiceRecord | null>(null);
+
+  /**
+   * Merged Master Inventory:
+   * Combines the 20,738+ Vietnamese grocery barcodes (`893...`) from VIETNAM_MASTER_PRODUCTS_LIST
+   * with user's custom or edited Firestore records (`dbProducts`), so all 20,738+ products
+   * are immediately available in Kho Hàng & POS while any price/stock edits persist to Firestore.
+   */
+  const allProducts = useMemo<Product[]>(() => {
+    const dbByBarcode = new Map<string, Product>();
+    for (const p of dbProducts) {
+      dbByBarcode.set(p.barcode, { ...p, isCustomOrEdited: true });
+    }
+
+    const merged: Product[] = [];
+
+    // 1. Add user-created barcodes that are not in the base master catalog first
+    for (const p of dbProducts) {
+      if (!VIETNAM_BARCODE_CATALOG[p.barcode] && !deletedBarcodes[p.barcode]) {
+        merged.push({ ...p, isCustomOrEdited: true });
+      }
+    }
+
+    // 2. Add all 20,738+ Vietnamese grocery barcodes (using Firestore override if edited)
+    for (const entry of VIETNAM_MASTER_PRODUCTS_LIST) {
+      if (deletedBarcodes[entry.barcode]) continue;
+      const override = dbByBarcode.get(entry.barcode);
+      if (override) {
+        merged.push(override);
+      } else {
+        merged.push({
+          id: `cat_${entry.barcode}`,
+          barcode: entry.barcode,
+          name: entry.name,
+          category: entry.category,
+          unit: entry.unit,
+          price: entry.suggestedPrice,
+          costPrice: entry.suggestedCostPrice,
+          stock: entry.defaultStock,
+          source: 'catalog_vn_9000',
+          ownerId: user?.uid || 'local',
+          isCustomOrEdited: false,
+        });
+      }
+    }
+
+    return merged;
+  }, [dbProducts, deletedBarcodes, user?.uid]);
+
+  // Multi-Tab POS Orders (Làm nhiều phiếu cùng một lúc)
+  const [orderTabs, setOrderTabs] = useState<PosOrderTab[]>(() => {
+    try {
+      const saved = localStorage.getItem('dung_canh_pos_tabs');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {
+      // Ignore storage error
+    }
+    return [createEmptyOrderTab(1), createEmptyOrderTab(2)];
+  });
+
+  const [activeTabId, setActiveTabId] = useState<string>(() => {
+    return orderTabs[0]?.id || '';
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('dung_canh_pos_tabs', JSON.stringify(orderTabs));
+    } catch {
+      // Ignore storage error
+    }
+  }, [orderTabs]);
+
+  const activeOrderTab = useMemo(() => {
+    return orderTabs.find((t) => t.id === activeTabId) || orderTabs[0];
+  }, [orderTabs, activeTabId]);
+
+  const [currentInvoiceCode, setCurrentInvoiceCode] = useState<string>(() =>
+    generateInvoiceCode()
+  );
+
+  // Scanner & Search State in POS
+  const [posScannerInput, setPosScannerInput] = useState('');
+  const [posProductFilter, setPosProductFilter] = useState('');
+  const [posCategoryFilter, setPosCategoryFilter] = useState('ALL');
+  const [autoModalBarcode, setAutoModalBarcode] = useState<string | null>(null);
+  const [posFeedback, setPosFeedback] = useState<string>('');
+  const [isSavingInvoice, setIsSavingInvoice] = useState(false);
+  const [isBatchSyncing, setIsBatchSyncing] = useState(false);
+
+  // Quick Manual Line Item Addition on Bill
+  const [customItemName, setCustomItemName] = useState('');
+  const [customItemPrice, setCustomItemPrice] = useState<number>(10000);
+  const [customItemUnit] = useState('Cái');
+
+  // Inventory Page Search, Pagination & Inline Edit State
+  const [inventorySearch, setInventorySearch] = useState('');
+  const [inventoryCategory, setInventoryCategory] = useState('ALL');
+  const [inventoryPage, setInventoryPage] = useState<number>(1);
+  const [editingBarcode, setEditingBarcode] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<{
+    name: string;
+    price: number;
+    costPrice: number;
+    stock: number;
+    unit: string;
+    category: string;
+  } | null>(null);
+
+  // Global Confirmation Dialog State for ALL Delete Actions
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    onConfirm: () => void | Promise<void>;
+  } | null>(null);
+
+  const scannerInputRef = useRef<HTMLInputElement>(null);
+
+  // 1. Firebase Auth Listener
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Real-time Firestore Listeners for Products & Invoices
+  useEffect(() => {
+    if (!isAuthReady || !user) {
+      setDbProducts([]);
+      setInvoices([]);
+      return;
+    }
+
+    const productsQuery = query(
+      collection(db, 'products'),
+      where('ownerId', '==', user.uid)
+    );
+
+    const unsubProducts = onSnapshot(
+      productsQuery,
+      (snapshot) => {
+        const list: Product[] = snapshot.docs.map((docSnap) => {
+          const data = docSnap.data();
+          return {
+            id: docSnap.id,
+            barcode: String(data.barcode || ''),
+            name: String(data.name || ''),
+            category: String(data.category || 'Hàng tạp hóa khác'),
+            unit: String(data.unit || 'Cái'),
+            price: Number(data.price) || 0,
+            costPrice: Number(data.costPrice) || 0,
+            stock: Number(data.stock) || 0,
+            source: String(data.source || 'manual'),
+            ownerId: String(data.ownerId || user.uid),
+            isCustomOrEdited: true,
+            createdAt: data.createdAt,
+            updatedAt: data.updatedAt,
+          };
+        });
+        setDbProducts(list);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'products');
+      }
+    );
+
+    const invoicesQuery = query(
+      collection(db, 'invoices'),
+      where('ownerId', '==', user.uid)
+    );
+
+    const unsubInvoices = onSnapshot(
+      invoicesQuery,
+      (snapshot) => {
+        const list: InvoiceRecord[] = snapshot.docs.map((docSnap) => {
+          const data = docSnap.data();
+          let parsedItems: BillLineItem[] = [];
+          try {
+            parsedItems = JSON.parse(String(data.itemsJson || '[]'));
+          } catch {
+            parsedItems = [];
+          }
+          const createdTs = data.createdAt as Timestamp | undefined;
+          return {
+            id: docSnap.id,
+            invoiceCode: String(data.invoiceCode || docSnap.id),
+            tabName: String(data.tabName || 'Phiếu 1'),
+            customerName: String(data.customerName || 'Khách lẻ'),
+            itemsJson: String(data.itemsJson || '[]'),
+            items: parsedItems,
+            itemCount: Number(data.itemCount) || 0,
+            subtotal: Number(data.subtotal) || 0,
+            discount: Number(data.discount) || 0,
+            totalAmount: Number(data.totalAmount) || 0,
+            amountTendered: Number(data.amountTendered) || 0,
+            changeDue: Number(data.changeDue) || 0,
+            paperWidth: data.paperWidth === '58mm' ? '58mm' : '80mm',
+            ownerId: String(data.ownerId || user.uid),
+            createdAt: data.createdAt,
+            createdAtDate: createdTs?.toDate ? createdTs.toDate() : new Date(),
+          };
+        });
+        list.sort(
+          (a, b) =>
+            (b.createdAtDate?.getTime() || 0) - (a.createdAtDate?.getTime() || 0)
+        );
+        setInvoices(list);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'invoices');
+      }
+    );
+
+    return () => {
+      unsubProducts();
+      unsubInvoices();
+    };
+  }, [isAuthReady, user]);
+
+  // Sign In with Google Popup
+  const handleGoogleSignIn = async () => {
+    setAuthError('');
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (error) {
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Không thể đăng nhập bằng Google.'
+      );
+    }
+  };
+
+  const handleSignOut = async () => {
+    await signOut(auth);
+  };
+
+  // Multi-Tab POS Helpers
+  const updateActiveTab = (updater: (tab: PosOrderTab) => PosOrderTab) => {
+    setOrderTabs((prev) =>
+      prev.map((tab) => (tab.id === activeOrderTab.id ? updater(tab) : tab))
+    );
+  };
+
+  const handleAddOrderTab = () => {
+    const maxNum = orderTabs.reduce(
+      (max, t) => Math.max(max, t.tabNumber || 1),
+      0
+    );
+    const nextTab = createEmptyOrderTab(maxNum + 1);
+    setOrderTabs((prev) => [...prev, nextTab]);
+    setActiveTabId(nextTab.id);
+    setCurrentInvoiceCode(generateInvoiceCode());
+  };
+
+  const handleCloseOrderTab = (tabId: string) => {
+    const targetTab = orderTabs.find((t) => t.id === tabId);
+    const itemCount = targetTab
+      ? targetTab.items.reduce((sum, i) => sum + i.quantity, 0)
+      : 0;
+    const tabName = targetTab?.label || 'Phiếu bán hàng';
+
+    setConfirmDialog({
+      title: `Xác nhận xóa ${tabName}`,
+      message: `Bạn có chắc chắn muốn xóa ${tabName}${
+        itemCount > 0 ? ` (đang có ${itemCount} món hàng)` : ''
+      } không?`,
+      confirmLabel: 'Chắc chắn xóa phiếu',
+      onConfirm: () => {
+        if (orderTabs.length <= 1) {
+          const resetTab = createEmptyOrderTab(1);
+          setOrderTabs([resetTab]);
+          setActiveTabId(resetTab.id);
+          return;
+        }
+        const remaining = orderTabs.filter((t) => t.id !== tabId);
+        setOrderTabs(remaining);
+        if (activeTabId === tabId) {
+          setActiveTabId(remaining[0].id);
+        }
+      },
+    });
+  };
+
+  // Add Product to Active Bill Tab
+  const addProductToActiveBill = (
+    product: {
+      id?: string;
+      barcode: string;
+      name: string;
+      unit: string;
+      price: number;
+    },
+    qtyToAdd = 1
+  ) => {
+    updateActiveTab((tab) => {
+      const existingIndex = tab.items.findIndex(
+        (item) =>
+          item.barcode === product.barcode && item.name === product.name
+      );
+      if (existingIndex > -1) {
+        const updated = [...tab.items];
+        updated[existingIndex] = {
+          ...updated[existingIndex],
+          quantity: updated[existingIndex].quantity + qtyToAdd,
+        };
+        return { ...tab, items: updated };
+      }
+      const newLine: BillLineItem = {
+        lineId: `line_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        productId: product.id,
+        barcode: product.barcode,
+        name: product.name,
+        unit: product.unit,
+        price: product.price,
+        quantity: qtyToAdd,
+      };
+      return { ...tab, items: [...tab.items, newLine] };
+    });
+  };
+
+  // Barcode Scan Handler in POS
+  const handleBarcodeScannedInPos = (rawCode: string) => {
+    const cleanCode = rawCode.trim().replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!cleanCode) return;
+
+    setPosScannerInput('');
+
+    // 1. Check in allProducts (which includes Firestore + 20,738+ Vietnamese barcodes)
+    const matched = allProducts.find(
+      (p) => p.barcode.toLowerCase() === cleanCode.toLowerCase()
+    );
+    if (matched) {
+      addProductToActiveBill(matched, 1);
+      setPosFeedback(
+        `Đã quét mã ${matched.barcode}: +1 ${matched.name} (${formatVND(matched.price)} đ)`
+      );
+      return;
+    }
+
+    // 2. If not found yet, open automatic barcode lookup modal so user only needs to confirm price & quantity!
+    setPosFeedback(
+      `Mã vạch ${cleanCode} mới — Đang tự động tra cứu thông tin để bạn lưu nhanh...`
+    );
+    setAutoModalBarcode(cleanCode);
+  };
+
+  // Save or Update Product in Firestore (adhering strictly to firestore.rules)
+  const handleSaveProductToFirestore = async (
+    productData: {
+      barcode: string;
+      name: string;
+      category: string;
+      unit: string;
+      price: number;
+      costPrice: number;
+      stock: number;
+      source: string;
+    },
+    addToActiveBillAfterSave: boolean,
+    billQuantity: number
+  ) => {
+    const cleanBarcode = productData.barcode
+      .trim()
+      .replace(/[^a-zA-Z0-9_-]/g, '')
+      .slice(0, 64);
+
+    if (addToActiveBillAfterSave) {
+      addProductToActiveBill(
+        {
+          barcode: cleanBarcode,
+          name: productData.name.trim(),
+          unit: productData.unit.trim(),
+          price: Math.max(0, Math.round(productData.price)),
+        },
+        billQuantity
+      );
+    }
+
+    if (!user) {
+      setAuthError(
+        'Vui lòng đăng nhập Google để lưu thay đổi giá & tồn kho vào cơ sở dữ liệu.'
+      );
+      if (autoModalBarcode) setAutoModalBarcode(null);
+      return;
+    }
+
+    const existingInDb = dbProducts.find((p) => p.barcode === cleanBarcode);
+    const docId = existingInDb
+      ? existingInDb.id
+      : `prod_${cleanBarcode}_${user.uid.slice(0, 8)}`.replace(
+          /[^a-zA-Z0-9_-]/g,
+          '_'
+        );
+
+    const path = `products/${docId}`;
+    try {
+      if (existingInDb) {
+        await updateDoc(doc(db, 'products', docId), {
+          barcode: cleanBarcode,
+          name: productData.name.trim().slice(0, 200),
+          category: productData.category.trim().slice(0, 100),
+          unit: productData.unit.trim().slice(0, 50),
+          price: Math.max(0, Math.round(productData.price)),
+          costPrice: Math.max(0, Math.round(productData.costPrice)),
+          stock: Math.max(0, Math.round(productData.stock)),
+          source: productData.source.trim().slice(0, 50),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        await setDoc(doc(db, 'products', docId), {
+          barcode: cleanBarcode,
+          name: productData.name.trim().slice(0, 200),
+          category: productData.category.trim().slice(0, 100),
+          unit: productData.unit.trim().slice(0, 50),
+          price: Math.max(0, Math.round(productData.price)),
+          costPrice: Math.max(0, Math.round(productData.costPrice)),
+          stock: Math.max(0, Math.round(productData.stock)),
+          source: productData.source.trim().slice(0, 50),
+          ownerId: user.uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      if (autoModalBarcode) {
+        setAutoModalBarcode(null);
+      }
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        existingInDb ? OperationType.UPDATE : OperationType.CREATE,
+        path
+      );
+    }
+  };
+
+  // Line Item Inline Editing Handlers on the Active Bill / Receipt
+  const handleUpdateBillItemName = (lineId: string, newName: string) => {
+    updateActiveTab((tab) => ({
+      ...tab,
+      items: tab.items.map((item) =>
+        item.lineId === lineId ? { ...item, name: newName } : item
+      ),
+    }));
+  };
+
+  const handleUpdateBillItemPrice = (lineId: string, newPrice: number) => {
+    updateActiveTab((tab) => ({
+      ...tab,
+      items: tab.items.map((item) =>
+        item.lineId === lineId ? { ...item, price: newPrice } : item
+      ),
+    }));
+  };
+
+  const handleUpdateBillItemQuantity = (lineId: string, newQty: number) => {
+    updateActiveTab((tab) => ({
+      ...tab,
+      items: tab.items.map((item) =>
+        item.lineId === lineId
+          ? { ...item, quantity: Math.max(1, newQty) }
+          : item
+      ),
+    }));
+  };
+
+  const handleRemoveBillItem = (lineId: string) => {
+    const targetItem = activeOrderTab.items.find((i) => i.lineId === lineId);
+    setConfirmDialog({
+      title: 'Xác nhận xóa hàng hóa khỏi phiếu',
+      message: `Bạn có chắc chắn muốn xóa mặt hàng "${
+        targetItem?.name || 'này'
+      }" khỏi ${activeOrderTab.label} không?`,
+      confirmLabel: 'Chắc chắn xóa món',
+      onConfirm: () => {
+        updateActiveTab((tab) => ({
+          ...tab,
+          items: tab.items.filter((item) => item.lineId !== lineId),
+        }));
+      },
+    });
+  };
+
+  // Print Thermal Receipt & Save Invoice + Deduct Inventory Stock in Firestore
+  const handlePrintAndSaveInvoice = async () => {
+    if (activeOrderTab.items.length === 0) return;
+
+    const subtotal = activeOrderTab.items.reduce(
+      (sum, item) => sum + item.price * item.quantity,
+      0
+    );
+    const itemCount = activeOrderTab.items.reduce(
+      (sum, item) => sum + item.quantity,
+      0
+    );
+    const discount = Math.max(0, Math.round(activeOrderTab.discount || 0));
+    const totalAmount = Math.max(0, subtotal - discount);
+    const amountTendered =
+      activeOrderTab.amountTendered > 0
+        ? Math.round(activeOrderTab.amountTendered)
+        : totalAmount;
+    const changeDue = Math.max(0, amountTendered - totalAmount);
+
+    setIsSavingInvoice(true);
+    try {
+      if (user) {
+        const invId = `inv_${Date.now()}_${user.uid.slice(0, 6)}`.replace(
+          /[^a-zA-Z0-9_-]/g,
+          '_'
+        );
+        const serializedItems = JSON.stringify(
+          activeOrderTab.items.map((i) => ({
+            lineId: i.lineId,
+            barcode: i.barcode,
+            name: i.name.trim() || 'Hàng tạp hóa',
+            unit: i.unit,
+            price: i.price,
+            quantity: i.quantity,
+          }))
+        ).slice(0, 4000);
+
+        await setDoc(doc(db, 'invoices', invId), {
+          invoiceCode: currentInvoiceCode.slice(0, 64),
+          tabName: activeOrderTab.label.slice(0, 100),
+          customerName: (activeOrderTab.customerName.trim() || 'Khách lẻ').slice(
+            0,
+            150
+          ),
+          itemsJson: serializedItems,
+          itemCount,
+          subtotal,
+          discount,
+          totalAmount,
+          amountTendered,
+          changeDue,
+          paperWidth: storeProfile.paperWidth,
+          ownerId: user.uid,
+          createdAt: serverTimestamp(),
+        });
+
+        // Deduct inventory stock in Firestore for items already synced in dbProducts
+        for (const line of activeOrderTab.items) {
+          const matchedInDb = dbProducts.find(
+            (p) => p.barcode === line.barcode
+          );
+          if (matchedInDb) {
+            const nextStock = Math.max(0, matchedInDb.stock - line.quantity);
+            await updateDoc(doc(db, 'products', matchedInDb.id), {
+              stock: nextStock,
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+      }
+
+      // Trigger browser thermal print dialog
+      window.print();
+
+      // Clear current tab after printing and generate fresh invoice code
+      updateActiveTab((tab) => ({
+        ...tab,
+        items: [],
+        discount: 0,
+        amountTendered: 0,
+        customerName: 'Khách lẻ',
+      }));
+      setCurrentInvoiceCode(generateInvoiceCode());
+      setPosFeedback(
+        `Đã lưu & phát lệnh in hóa đơn ${currentInvoiceCode} thành công!`
+      );
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, 'invoices');
+    } finally {
+      setIsSavingInvoice(false);
+    }
+  };
+
+  // Filtered Lists across all 20,738+ Vietnamese grocery products
+  const filteredPosProducts = useMemo(() => {
+    const q = posProductFilter.trim().toLowerCase();
+    const results: Product[] = [];
+    for (const p of allProducts) {
+      if (posCategoryFilter !== 'ALL' && p.category !== posCategoryFilter) {
+        continue;
+      }
+      if (
+        !q ||
+        p.barcode.toLowerCase().includes(q) ||
+        p.name.toLowerCase().includes(q)
+      ) {
+        results.push(p);
+        if (results.length >= 60) break;
+      }
+    }
+    return results;
+  }, [allProducts, posCategoryFilter, posProductFilter]);
+
+  const filteredInventoryProducts = useMemo(() => {
+    const q = inventorySearch.trim().toLowerCase();
+    return allProducts.filter((p) => {
+      const matchesCat =
+        inventoryCategory === 'ALL' || p.category === inventoryCategory;
+      if (!matchesCat) return false;
+      if (!q) return true;
+      return (
+        p.barcode.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)
+      );
+    });
+  }, [allProducts, inventoryCategory, inventorySearch]);
+
+  useEffect(() => {
+    setInventoryPage(1);
+  }, [inventorySearch, inventoryCategory]);
+
+  const totalInventoryPages = Math.max(
+    1,
+    Math.ceil(filteredInventoryProducts.length / INVENTORY_PAGE_SIZE)
+  );
+
+  const visibleInventoryPageItems = useMemo(() => {
+    const start = (inventoryPage - 1) * INVENTORY_PAGE_SIZE;
+    return filteredInventoryProducts.slice(start, start + INVENTORY_PAGE_SIZE);
+  }, [filteredInventoryProducts, inventoryPage]);
+
+  // Batch sync current page of products to Firestore
+  const handleBatchSyncVisiblePageToFirestore = async () => {
+    if (!user) {
+      setAuthError('Vui lòng đăng nhập Google để đồng bộ lên Cloud CSDL.');
+      return;
+    }
+    setIsBatchSyncing(true);
+    try {
+      for (const item of visibleInventoryPageItems) {
+        const alreadyInDb = dbProducts.some((p) => p.barcode === item.barcode);
+        if (!alreadyInDb) {
+          const docId = `prod_${item.barcode}_${user.uid.slice(0, 8)}`.replace(
+            /[^a-zA-Z0-9_-]/g,
+            '_'
+          );
+          await setDoc(doc(db, 'products', docId), {
+            barcode: item.barcode,
+            name: item.name.slice(0, 200),
+            category: item.category.slice(0, 100),
+            unit: item.unit.slice(0, 50),
+            price: item.price,
+            costPrice: item.costPrice,
+            stock: item.stock,
+            source: 'catalog_vn_9000',
+            ownerId: user.uid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, 'products');
+    } finally {
+      setIsBatchSyncing(false);
+    }
+  };
+
+  // Custom QR image upload handler in "Lịch sử bill"
+  const handleUploadCustomQrImage = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        setStoreProfile((prev) => ({
+          ...prev,
+          customQrDataUrl: reader.result as string,
+        }));
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const activeTabSubtotal = activeOrderTab.items.reduce(
+    (sum, item) => sum + item.price * item.quantity,
+    0
+  );
+  const activeTabTotal = Math.max(
+    0,
+    activeTabSubtotal - (activeOrderTab.discount || 0)
+  );
+
+  return (
+    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
+      {/* STRICT 3-ZONE TOP BAR CONTRACT */}
+      <header className="no-print flex items-center justify-between gap-8 px-6 py-3.5 bg-white border-b border-slate-200 sticky top-0 z-30">
+        {/* Zone 1: Single text element wordmark */}
+        <a
+          href="#pos"
+          onClick={(e) => {
+            e.preventDefault();
+            setActiveSection('pos');
+          }}
+          className="text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
+        >
+          Tạp Hóa Dung Cảnh
+        </a>
+
+        {/* Zone 2: 4 concise single-line text navigation links */}
+        <nav className="flex items-center gap-6 text-sm font-medium text-slate-600 overflow-x-auto">
+          <a
+            href="#pos"
+            onClick={(e) => {
+              e.preventDefault();
+              setActiveSection('pos');
+            }}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeSection === 'pos'
+                ? 'text-slate-900 font-semibold border-emerald-600'
+                : 'border-transparent hover:text-slate-900'
+            }`}
+          >
+            Lên Bill ({orderTabs.length})
+          </a>
+          <a
+            href="#barcode-add"
+            onClick={(e) => {
+              e.preventDefault();
+              setActiveSection('barcode_add');
+            }}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeSection === 'barcode_add'
+                ? 'text-slate-900 font-semibold border-emerald-600'
+                : 'border-transparent hover:text-slate-900'
+            }`}
+          >
+            Nhập Barcode Tự Động
+          </a>
+          <a
+            href="#inventory"
+            onClick={(e) => {
+              e.preventDefault();
+              setActiveSection('inventory');
+            }}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeSection === 'inventory'
+                ? 'text-slate-900 font-semibold border-emerald-600'
+                : 'border-transparent hover:text-slate-900'
+            }`}
+          >
+            Kho Hàng ({formatVND(allProducts.length)} mã)
+          </a>
+          <a
+            href="#invoices"
+            onClick={(e) => {
+              e.preventDefault();
+              setActiveSection('invoices');
+            }}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeSection === 'invoices'
+                ? 'text-slate-900 font-semibold border-emerald-600'
+                : 'border-transparent hover:text-slate-900'
+            }`}
+          >
+            Lịch Sử Bill & Mã QR ({invoices.length})
+          </a>
+        </nav>
+
+        {/* Zone 3: 1 primary action */}
+        <div className="flex items-center shrink-0">
+          {user ? (
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+              title={`Đăng nhập: ${user.email || ''}`}
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Đăng Xuất</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleGoogleSignIn}
+              className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+            >
+              <LogIn className="w-3.5 h-3.5" />
+              <span>Đăng Nhập Lưu Kho</span>
+            </button>
+          )}
+        </div>
+      </header>
+
+      {/* Authentication Banner when not signed in */}
+      {isAuthReady && !user && (
+        <div className="no-print bg-amber-50 border-b border-amber-200 px-6 py-2.5 flex flex-wrap items-center justify-between gap-4">
+          <div className="text-xs text-amber-900">
+            <span className="font-semibold">Kho hàng đã tích hợp sẵn {formatVND(allProducts.length)} mã hàng tạp hóa Việt Nam (893...):</span> Để lưu thay đổi giá bán lẻ và lịch sử hóa đơn vĩnh viễn vào Cloud CSDL, vui lòng đăng nhập Google.
+          </div>
+          <button
+            type="button"
+            onClick={handleGoogleSignIn}
+            className="px-3 py-1.5 bg-slate-900 text-white text-xs font-semibold rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Đăng nhập Google ngay
+          </button>
+        </div>
+      )}
+
+      {authError && (
+        <div className="no-print bg-red-50 border-b border-red-200 px-6 py-2 text-xs text-red-700 flex items-center justify-between">
+          <span>{authError}</span>
+          <button
+            type="button"
+            onClick={() => setAuthError('')}
+            className="text-red-500 hover:text-red-800"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* MAIN WORKSPACE CONTENT */}
+      <main className="flex-1 max-w-[1440px] w-full mx-auto px-6 py-5">
+        {/* ========================================================= */}
+        {/* SECTION 1: LÊN BILL (POS BÁN HÀNG & LÀM NHIỀU PHIẾU CÙNG LÚC) */}
+        {/* ========================================================= */}
+        {activeSection === 'pos' && (
+          <div className="space-y-4">
+            {/* Multi-Order Tabs Bar (Làm nhiều phiếu cùng một lúc) */}
+            <div className="no-print flex flex-wrap items-center justify-between gap-3 bg-white border border-slate-200 rounded-xl p-2.5">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {orderTabs.map((tab) => {
+                  const isActive = tab.id === activeOrderTab.id;
+                  const tabItemCount = tab.items.reduce(
+                    (s, i) => s + i.quantity,
+                    0
+                  );
+                  return (
+                    <div
+                      key={tab.id}
+                      className={`inline-flex items-center rounded-lg transition-colors ${
+                        isActive
+                          ? 'bg-slate-900 text-white'
+                          : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setActiveTabId(tab.id)}
+                        className="px-3 py-1.5 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        <span>{tab.label}</span>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-mono tabular-nums">
+                          {tabItemCount} món
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleCloseOrderTab(tab.id)}
+                        className={`pr-2 pl-1 py-1.5 hover:text-red-400 transition-colors cursor-pointer ${
+                          isActive ? 'text-slate-300' : 'text-slate-400'
+                        }`}
+                        title={`Đóng hoặc làm mới ${tab.label}`}
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  );
+                })}
+
+                <button
+                  type="button"
+                  onClick={handleAddOrderTab}
+                  className="px-3 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-lg flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Tạo Phiếu Mới (Khách Chờ)</span>
+                </button>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setActiveSection('invoices')}
+                  className="px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <QrCode className="w-3.5 h-3.5" />
+                  <span>Cài đặt Mã QR Ngân hàng</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAutoModalBarcode('')}
+                  className="px-3 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <PackagePlus className="w-3.5 h-3.5" />
+                  <span>Quét thêm sản phẩm mới</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 2-Column Split: Left (Barcode Scanner + Editable Bill Table + Product Grid) | Right (Thermal Receipt Preview) */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch">
+              {/* LEFT COLUMN (7 cols): Scanner Input, Active Bill Line Items, and Quick Inventory Picker */}
+              <div className="no-print lg:col-span-7 flex flex-col gap-4">
+                {/* Barcode Scanner Bar */}
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                      <Barcode className="w-4 h-4 text-emerald-600" />
+                      <span>
+                        Ô Quét Mã Vạch Máy Quét (Tra cứu tức thì trong{' '}
+                        {formatVND(allProducts.length)} mã hàng Việt Nam)
+                      </span>
+                    </label>
+                    <span className="text-[11px] text-slate-500">
+                      Nhấn Enter sau khi quét
+                    </span>
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      ref={scannerInputRef}
+                      type="text"
+                      value={posScannerInput}
+                      onChange={(e) => setPosScannerInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleBarcodeScannedInPos(posScannerInput);
+                        }
+                      }}
+                      placeholder="Đặt con trỏ tại đây và bấm máy quét barcode (VD: 8934563138165)..."
+                      className="flex-1 px-3.5 py-2.5 text-sm font-mono bg-slate-50 border border-slate-300 rounded-lg focus:bg-white focus:border-emerald-600 focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleBarcodeScannedInPos(posScannerInput)}
+                      className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Quét / Nhập Mã
+                    </button>
+                  </div>
+                  {posFeedback && (
+                    <div className="mt-2.5 text-xs text-emerald-800 bg-emerald-50 px-3 py-1.5 rounded-lg flex items-center justify-between">
+                      <span>{posFeedback}</span>
+                      <button
+                        type="button"
+                        onClick={() => setPosFeedback('')}
+                        className="text-emerald-600 hover:text-emerald-900"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Active Bill Editable Table ("Trên phần hóa đơn vẫn có thể sửa tên hàng hóa trước khi in") */}
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2 pb-3 mb-3 border-b border-slate-200">
+                    <div>
+                      <h2 className="text-sm font-bold text-slate-900">
+                        Chi Tiết Hàng Hóa Trong {activeOrderTab.label}
+                      </h2>
+                      <p className="text-xs text-slate-500">
+                        Bạn có thể sửa trực tiếp tên hàng hóa, số lượng và đơn giá ngay tại bảng này hoặc trên tờ hóa đơn bên phải trước khi in.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={activeOrderTab.customerName}
+                        onChange={(e) =>
+                          updateActiveTab((t) => ({
+                            ...t,
+                            customerName: e.target.value,
+                          }))
+                        }
+                        placeholder="Tên khách hàng / Ghi chú..."
+                        className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:border-slate-900 focus:outline-none w-44"
+                      />
+                    </div>
+                  </div>
+
+                  {activeOrderTab.items.length === 0 ? (
+                    <div className="py-8 text-center text-slate-500 text-xs">
+                      Chưa có sản phẩm nào trong {activeOrderTab.label}. Hãy quét mã vạch ở ô trên hoặc chọn sản phẩm bên dưới.
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse">
+                        <thead>
+                          <tr className="border-b border-slate-200 text-[11px] font-semibold text-slate-500">
+                            <th className="py-2 pr-2">Tên hàng hóa (Sửa trực tiếp)</th>
+                            <th className="py-2 px-2 w-20">ĐVT</th>
+                            <th className="py-2 px-2 w-28 text-center">Số lượng</th>
+                            <th className="py-2 px-2 w-32 text-right">Đơn giá (đ)</th>
+                            <th className="py-2 pl-2 w-28 text-right">Thành tiền</th>
+                            <th className="py-2 pl-2 w-8"></th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 text-xs">
+                          {activeOrderTab.items.map((item) => (
+                            <tr key={item.lineId} className="hover:bg-slate-50/80">
+                              <td className="py-2 pr-2">
+                                <input
+                                  type="text"
+                                  value={item.name}
+                                  maxLength={180}
+                                  onChange={(e) =>
+                                    handleUpdateBillItemName(
+                                      item.lineId,
+                                      e.target.value
+                                    )
+                                  }
+                                  className="w-full px-2 py-1 text-xs font-medium bg-slate-50 hover:bg-white focus:bg-white border border-transparent hover:border-slate-300 focus:border-emerald-600 rounded focus:outline-none"
+                                  title="Bấm để sửa tên hàng hóa trước khi in"
+                                />
+                                <div className="text-[11px] text-slate-400 font-mono px-2 mt-0.5">
+                                  Mã: {item.barcode}
+                                </div>
+                              </td>
+                              <td className="py-2 px-2">
+                                <input
+                                  type="text"
+                                  value={item.unit}
+                                  maxLength={30}
+                                  onChange={(e) =>
+                                    updateActiveTab((tab) => ({
+                                      ...tab,
+                                      items: tab.items.map((i) =>
+                                        i.lineId === item.lineId
+                                          ? { ...i, unit: e.target.value }
+                                          : i
+                                      ),
+                                    }))
+                                  }
+                                  className="w-16 px-2 py-1 text-xs bg-slate-50 border border-slate-200 rounded focus:bg-white focus:outline-none"
+                                />
+                              </td>
+                              <td className="py-2 px-2">
+                                <div className="flex items-center justify-center gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleUpdateBillItemQuantity(
+                                        item.lineId,
+                                        Math.max(1, item.quantity - 1)
+                                      )
+                                    }
+                                    className="w-6 h-6 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold flex items-center justify-center"
+                                  >
+                                    -
+                                  </button>
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    value={item.quantity}
+                                    onChange={(e) =>
+                                      handleUpdateBillItemQuantity(
+                                        item.lineId,
+                                        Math.max(1, Number(e.target.value) || 1)
+                                      )
+                                    }
+                                    className="w-12 text-center font-mono tabular-nums font-semibold py-1 bg-white border border-slate-200 rounded"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleUpdateBillItemQuantity(
+                                        item.lineId,
+                                        item.quantity + 1
+                                      )
+                                    }
+                                    className="w-6 h-6 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold flex items-center justify-center"
+                                  >
+                                    +
+                                  </button>
+                                </div>
+                              </td>
+                              <td className="py-2 px-2 text-right">
+                                <input
+                                  type="number"
+                                  min={0}
+                                  step={500}
+                                  value={item.price}
+                                  onChange={(e) =>
+                                    handleUpdateBillItemPrice(
+                                      item.lineId,
+                                      Math.max(0, Number(e.target.value) || 0)
+                                    )
+                                  }
+                                  className="w-24 px-2 py-1 text-right font-mono tabular-nums font-medium bg-slate-50 border border-slate-200 rounded focus:bg-white focus:border-emerald-600 focus:outline-none"
+                                />
+                              </td>
+                              <td className="py-2 pl-2 text-right font-mono tabular-nums font-bold text-slate-900">
+                                {formatVND(item.price * item.quantity)}
+                              </td>
+                              <td className="py-2 pl-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveBillItem(item.lineId)}
+                                  className="p-1 text-slate-400 hover:text-red-600"
+                                  title="Xóa món"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {/* Quick Custom Item Row & Payment Calculator */}
+                  <div className="mt-4 pt-3 border-t border-slate-200 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* Add quick walk-in item without barcode */}
+                    <div>
+                      <div className="text-[11px] font-semibold text-slate-600 mb-1.5">
+                        Thêm nhanh món lẻ ngoài danh mục vào phiếu:
+                      </div>
+                      <div className="flex gap-1.5">
+                        <input
+                          type="text"
+                          value={customItemName}
+                          onChange={(e) => setCustomItemName(e.target.value)}
+                          placeholder="Tên món (VD: Túi đá, Rau...)"
+                          className="flex-1 px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none"
+                        />
+                        <input
+                          type="number"
+                          min={0}
+                          step={500}
+                          value={customItemPrice}
+                          onChange={(e) =>
+                            setCustomItemPrice(
+                              Math.max(0, Number(e.target.value) || 0)
+                            )
+                          }
+                          className="w-24 px-2 py-1.5 text-xs font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg text-right"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!customItemName.trim()) return;
+                            addProductToActiveBill(
+                              {
+                                barcode: 'HANG-LE',
+                                name: customItemName.trim(),
+                                unit: customItemUnit,
+                                price: customItemPrice,
+                              },
+                              1
+                            );
+                            setCustomItemName('');
+                          }}
+                          className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          + Thêm
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Discount & Cash Tendered */}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="text-slate-600">Giảm giá (VNĐ):</span>
+                        <input
+                          type="number"
+                          min={0}
+                          step={1000}
+                          value={activeOrderTab.discount || 0}
+                          onChange={(e) =>
+                            updateActiveTab((t) => ({
+                              ...t,
+                              discount: Math.max(0, Number(e.target.value) || 0),
+                            }))
+                          }
+                          className="w-32 px-2.5 py-1 text-right font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg"
+                        />
+                      </div>
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="text-slate-600">Tiền khách đưa:</span>
+                        <input
+                          type="number"
+                          min={0}
+                          step={1000}
+                          value={
+                            activeOrderTab.amountTendered || activeTabTotal
+                          }
+                          onChange={(e) =>
+                            updateActiveTab((t) => ({
+                              ...t,
+                              amountTendered: Math.max(
+                                0,
+                                Number(e.target.value) || 0
+                              ),
+                            }))
+                          }
+                          className="w-32 px-2.5 py-1 text-right font-mono tabular-nums font-semibold bg-emerald-50 border border-emerald-300 rounded-lg"
+                        />
+                      </div>
+                      <div className="flex flex-wrap justify-end gap-1">
+                        {[0, 50000, 100000, 200000, 500000].map((cash) => (
+                          <button
+                            key={cash}
+                            type="button"
+                            onClick={() =>
+                              updateActiveTab((t) => ({
+                                ...t,
+                                amountTendered:
+                                  cash === 0 ? activeTabTotal : cash,
+                              }))
+                            }
+                            className="px-2 py-0.5 text-[11px] font-mono tabular-nums bg-slate-100 hover:bg-slate-200 text-slate-700 rounded cursor-pointer"
+                          >
+                            {cash === 0 ? 'Đưa đủ' : `${formatVND(cash)}`}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Quick Product Grid from 20,738+ Vietnamese Grocery Items */}
+                <div className="bg-white border border-slate-200 rounded-xl p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+                    <h3 className="text-sm font-bold text-slate-900">
+                      Chọn Nhanh Hàng Hóa Từ Kho ({formatVND(allProducts.length)} mã hàng Việt Nam)
+                    </h3>
+                    <div className="relative w-64">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="text"
+                        value={posProductFilter}
+                        onChange={(e) => setPosProductFilter(e.target.value)}
+                        placeholder="Tìm trong 20.000+ mã hàng..."
+                        className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:border-slate-900 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Category Filter Bar */}
+                  <div className="flex items-center gap-1 overflow-x-auto pb-2 mb-3">
+                    <button
+                      type="button"
+                      onClick={() => setPosCategoryFilter('ALL')}
+                      className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                        posCategoryFilter === 'ALL'
+                          ? 'bg-slate-900 text-white'
+                          : 'bg-slate-100 text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Tất cả
+                    </button>
+                    {PRODUCT_CATEGORIES.map((cat) => (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => setPosCategoryFilter(cat)}
+                        className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                          posCategoryFilter === cat
+                            ? 'bg-slate-900 text-white'
+                            : 'bg-slate-100 text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {cat}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 max-h-[340px] overflow-y-auto pr-1">
+                    {filteredPosProducts.map((prod) => (
+                      <button
+                        key={prod.barcode}
+                        type="button"
+                        onClick={() => addProductToActiveBill(prod, 1)}
+                        className="p-3 text-left bg-slate-50 hover:bg-emerald-50/70 border border-slate-200 hover:border-emerald-400 rounded-lg transition-colors flex flex-col justify-between cursor-pointer"
+                      >
+                        <div>
+                          <div className="text-xs font-semibold text-slate-900 line-clamp-2 leading-snug">
+                            {prod.name}
+                          </div>
+                          <div className="text-[11px] text-slate-500 mt-1 font-mono tabular-nums">
+                            {prod.barcode} · Kho: {prod.stock} {prod.unit}
+                          </div>
+                        </div>
+                        <div className="mt-2 pt-1.5 border-t border-slate-200/80 flex items-center justify-between">
+                          <span className="text-xs font-bold font-mono tabular-nums text-emerald-700">
+                            {formatVND(prod.price)} đ
+                          </span>
+                          <span className="text-[11px] text-slate-500">
+                            /{prod.unit}
+                          </span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* RIGHT COLUMN (5 cols): Live Editable Long Thermal Roll Receipt Preview & Print Action */}
+              <div className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-4 flex flex-col">
+                <ThermalReceipt
+                  invoiceCode={currentInvoiceCode}
+                  tabLabel={activeOrderTab.label}
+                  customerName={activeOrderTab.customerName}
+                  items={activeOrderTab.items}
+                  discount={activeOrderTab.discount}
+                  amountTendered={activeOrderTab.amountTendered}
+                  storeProfile={storeProfile}
+                  onUpdateItemName={handleUpdateBillItemName}
+                  onUpdateItemPrice={handleUpdateBillItemPrice}
+                  onUpdateItemQuantity={handleUpdateBillItemQuantity}
+                  onRemoveItem={handleRemoveBillItem}
+                  onChangePaperWidth={(width) =>
+                    setStoreProfile((prev) => ({ ...prev, paperWidth: width }))
+                  }
+                  onOpenQrSettings={() => setActiveSection('invoices')}
+                  onPrintAndSave={handlePrintAndSaveInvoice}
+                  isSaving={isSavingInvoice}
+                />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* SECTION 2: NHẬP BARCODE TỰ ĐỘNG (AUTO BARCODE LOOKUP & ADD) */}
+        {/* ========================================================= */}
+        {activeSection === 'barcode_add' && (
+          <div className="max-w-4xl mx-auto space-y-5">
+            <BarcodeAutoModal
+              existingProducts={allProducts}
+              onSaveProduct={handleSaveProductToFirestore}
+              isEmbedded={true}
+            />
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* SECTION 3: KHO HÀNG (20,738+ VIETNAMESE GROCERY BARCODES) */}
+        {/* ========================================================= */}
+        {activeSection === 'inventory' && (
+          <div className="bg-white border border-slate-200 rounded-xl p-5">
+            <div className="flex flex-wrap items-center justify-between gap-4 pb-4 mb-4 border-b border-slate-200">
+              <div>
+                <h1 className="text-lg font-bold text-slate-900">
+                  Kho Hàng Tạp Hóa Dung Cảnh ({formatVND(allProducts.length)} mã hàng Việt Nam)
+                </h1>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Đã tích hợp sẵn hơn {formatVND(allProducts.length)} mã vạch hàng tiêu dùng Việt Nam (đầu số 893...) vào kho hàng. Bấm sửa bất kỳ mặt hàng nào để điều chỉnh giá bán & tồn kho.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {user && (
+                  <button
+                    type="button"
+                    disabled={isBatchSyncing}
+                    onClick={handleBatchSyncVisiblePageToFirestore}
+                    className="px-3.5 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    title="Đồng bộ 50 mặt hàng trên trang hiện tại lên Cloud Firestore"
+                  >
+                    <Database className="w-3.5 h-3.5" />
+                    <span>
+                      {isBatchSyncing
+                        ? 'Đang đồng bộ trang này lên CSDL...'
+                        : 'Lưu trang này lên Cloud CSDL'}
+                    </span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setActiveSection('barcode_add')}
+                  className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Barcode className="w-4 h-4" />
+                  <span>Quét Barcode Thêm Hàng Mới</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Search & Category Filter */}
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+              <div className="relative w-full sm:w-96">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={inventorySearch}
+                  onChange={(e) => setInventorySearch(e.target.value)}
+                  placeholder={`Tìm nhanh trong ${formatVND(allProducts.length)} mã vạch hoặc tên sản phẩm...`}
+                  className="w-full pl-9 pr-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:border-slate-900 focus:outline-none"
+                />
+              </div>
+
+              <div className="flex items-center gap-1 overflow-x-auto pb-1">
+                <button
+                  type="button"
+                  onClick={() => setInventoryCategory('ALL')}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    inventoryCategory === 'ALL'
+                      ? 'bg-slate-900 text-white'
+                      : 'bg-slate-100 text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Tất cả ({formatVND(allProducts.length)})
+                </button>
+                {PRODUCT_CATEGORIES.map((cat) => (
+                  <button
+                    key={cat}
+                    type="button"
+                    onClick={() => setInventoryCategory(cat)}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      inventoryCategory === cat
+                        ? 'bg-slate-900 text-white'
+                        : 'bg-slate-100 text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {cat}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Pagination Info Strip */}
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-3 mb-2 border-b border-slate-200 text-xs text-slate-600">
+              <div>
+                Tìm thấy{' '}
+                <span className="font-bold font-mono tabular-nums text-slate-900">
+                  {formatVND(filteredInventoryProducts.length)}
+                </span>{' '}
+                mã hàng Việt Nam · Đang hiển thị trang{' '}
+                <span className="font-bold font-mono tabular-nums text-slate-900">
+                  {inventoryPage}
+                </span>{' '}
+                / {formatVND(totalInventoryPages)}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={inventoryPage <= 1}
+                  onClick={() => setInventoryPage((p) => Math.max(1, p - 1))}
+                  className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 rounded-md font-medium flex items-center gap-1 cursor-pointer"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                  <span>Trang trước</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={inventoryPage >= totalInventoryPages}
+                  onClick={() =>
+                    setInventoryPage((p) => Math.min(totalInventoryPages, p + 1))
+                  }
+                  className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 rounded-md font-medium flex items-center gap-1 cursor-pointer"
+                >
+                  <span>Trang tiếp</span>
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Inventory Data Table */}
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 text-xs font-semibold text-slate-500">
+                    <th className="py-2.5 pr-3">Mã Barcode (EAN-13)</th>
+                    <th className="py-2.5 px-3">Tên hàng hóa Việt Nam</th>
+                    <th className="py-2.5 px-3">Danh mục · ĐVT</th>
+                    <th className="py-2.5 px-3 text-right">Giá vốn (đ)</th>
+                    <th className="py-2.5 px-3 text-right">Giá bán lẻ (đ)</th>
+                    <th className="py-2.5 px-3 text-right">Tồn kho</th>
+                    <th className="py-2.5 pl-3 text-right">Thao tác</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-xs">
+                  {visibleInventoryPageItems.map((prod) => {
+                    const isEditing =
+                      editingBarcode === prod.barcode && editDraft !== null;
+
+                    return (
+                      <tr key={prod.barcode} className="hover:bg-slate-50">
+                        <td className="py-2.5 pr-3 font-mono tabular-nums text-slate-700">
+                          {prod.barcode}
+                        </td>
+                        <td className="py-2.5 px-3 font-semibold text-slate-900">
+                          {isEditing && editDraft ? (
+                            <input
+                              type="text"
+                              value={editDraft.name}
+                              maxLength={200}
+                              onChange={(e) =>
+                                setEditDraft({
+                                  ...editDraft,
+                                  name: e.target.value,
+                                })
+                              }
+                              className="w-full px-2 py-1 border border-slate-300 rounded bg-white"
+                            />
+                          ) : (
+                            <div>
+                              <span>{prod.name}</span>
+                              {prod.isCustomOrEdited && (
+                                <span className="ml-2 text-[11px] font-normal text-emerald-700">
+                                  · Đã lưu Cloud
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3 text-slate-500">
+                          {isEditing && editDraft ? (
+                            <div className="flex gap-1">
+                              <select
+                                value={editDraft.category}
+                                onChange={(e) =>
+                                  setEditDraft({
+                                    ...editDraft,
+                                    category: e.target.value,
+                                  })
+                                }
+                                className="px-1.5 py-1 border border-slate-300 rounded bg-white text-xs"
+                              >
+                                {PRODUCT_CATEGORIES.map((c) => (
+                                  <option key={c} value={c}>
+                                    {c}
+                                  </option>
+                                ))}
+                              </select>
+                              <select
+                                value={editDraft.unit}
+                                onChange={(e) =>
+                                  setEditDraft({
+                                    ...editDraft,
+                                    unit: e.target.value,
+                                  })
+                                }
+                                className="px-1.5 py-1 border border-slate-300 rounded bg-white text-xs"
+                              >
+                                {PRODUCT_UNITS.map((u) => (
+                                  <option key={u} value={u}>
+                                    {u}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                          ) : (
+                            <span>
+                              {prod.category} · {prod.unit}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600">
+                          {isEditing && editDraft ? (
+                            <input
+                              type="number"
+                              min={0}
+                              step={500}
+                              value={editDraft.costPrice}
+                              onChange={(e) =>
+                                setEditDraft({
+                                  ...editDraft,
+                                  costPrice: Math.max(
+                                    0,
+                                    Number(e.target.value) || 0
+                                  ),
+                                })
+                              }
+                              className="w-24 px-2 py-1 text-right border border-slate-300 rounded bg-white"
+                            />
+                          ) : (
+                            formatVND(prod.costPrice)
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums font-bold text-emerald-700">
+                          {isEditing && editDraft ? (
+                            <input
+                              type="number"
+                              min={0}
+                              step={500}
+                              value={editDraft.price}
+                              onChange={(e) =>
+                                setEditDraft({
+                                  ...editDraft,
+                                  price: Math.max(
+                                    0,
+                                    Number(e.target.value) || 0
+                                  ),
+                                })
+                              }
+                              className="w-24 px-2 py-1 text-right border border-emerald-500 rounded bg-white"
+                            />
+                          ) : (
+                            formatVND(prod.price)
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums font-semibold">
+                          {isEditing && editDraft ? (
+                            <input
+                              type="number"
+                              min={0}
+                              value={editDraft.stock}
+                              onChange={(e) =>
+                                setEditDraft({
+                                  ...editDraft,
+                                  stock: Math.max(
+                                    0,
+                                    Number(e.target.value) || 0
+                                  ),
+                                })
+                              }
+                              className="w-20 px-2 py-1 text-right border border-emerald-500 rounded bg-white"
+                            />
+                          ) : (
+                            <span>
+                              {prod.stock} {prod.unit}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 pl-3 text-right">
+                          <div className="inline-flex items-center gap-1.5">
+                            {isEditing && editDraft ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    await handleSaveProductToFirestore(
+                                      {
+                                        barcode: prod.barcode,
+                                        name: editDraft.name,
+                                        category: editDraft.category,
+                                        unit: editDraft.unit,
+                                        price: editDraft.price,
+                                        costPrice: editDraft.costPrice,
+                                        stock: editDraft.stock,
+                                        source: prod.source,
+                                      },
+                                      false,
+                                      1
+                                    );
+                                    setEditingBarcode(null);
+                                    setEditDraft(null);
+                                  }}
+                                  className="px-2.5 py-1 bg-emerald-600 text-white rounded hover:bg-emerald-700 flex items-center gap-1 cursor-pointer"
+                                >
+                                  <Check className="w-3.5 h-3.5" />
+                                  <span>Lưu</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingBarcode(null);
+                                    setEditDraft(null);
+                                  }}
+                                  className="p-1 text-slate-400 hover:text-slate-700"
+                                >
+                                  <X className="w-4 h-4" />
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    addProductToActiveBill(prod, 1);
+                                    setActiveSection('pos');
+                                  }}
+                                  className="px-2 py-1 text-xs bg-slate-100 hover:bg-emerald-50 hover:text-emerald-800 text-slate-700 rounded flex items-center gap-1 cursor-pointer"
+                                  title="Đưa vào phiếu đang mở"
+                                >
+                                  <ShoppingCart className="w-3 h-3" />
+                                  <span>Đưa vào Bill</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingBarcode(prod.barcode);
+                                    setEditDraft({
+                                      name: prod.name,
+                                      price: prod.price,
+                                      costPrice: prod.costPrice,
+                                      stock: prod.stock,
+                                      unit: prod.unit,
+                                      category: prod.category,
+                                    });
+                                  }}
+                                  className="p-1.5 text-slate-500 hover:text-slate-900 rounded cursor-pointer"
+                                  title="Sửa giá & số lượng"
+                                >
+                                  <Edit3 className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setConfirmDialog({
+                                      title: 'Xác nhận xóa sản phẩm khỏi Kho Hàng',
+                                      message: `Bạn có chắc chắn muốn xóa sản phẩm "${prod.name}" (Mã vạch: ${prod.barcode}) khỏi Kho Hàng không?`,
+                                      confirmLabel: 'Chắc chắn xóa sản phẩm',
+                                      onConfirm: async () => {
+                                        const nextDeleted = {
+                                          ...deletedBarcodes,
+                                          [prod.barcode]: true,
+                                        };
+                                        setDeletedBarcodes(nextDeleted);
+                                        try {
+                                          localStorage.setItem(
+                                            'dung_canh_deleted_barcodes',
+                                            JSON.stringify(nextDeleted)
+                                          );
+                                        } catch {
+                                          // Ignore
+                                        }
+                                        if (prod.isCustomOrEdited && user) {
+                                          try {
+                                            await deleteDoc(
+                                              doc(db, 'products', prod.id)
+                                            );
+                                          } catch (err) {
+                                            handleFirestoreError(
+                                              err,
+                                              OperationType.DELETE,
+                                              `products/${prod.id}`
+                                            );
+                                          }
+                                        }
+                                      },
+                                    });
+                                  }}
+                                  className="p-1.5 text-slate-400 hover:text-red-600 rounded cursor-pointer"
+                                  title="Xóa sản phẩm"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* SECTION 4: LỊCH SỬ BILL & ĐIỀU CHỈNH MÃ QR NGÂN HÀNG */}
+        {/* ========================================================= */}
+        {activeSection === 'invoices' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            {/* Left 7 cols: Bank QR Code Configuration + Store Receipt Settings + Historical Invoices List */}
+            <div className="no-print lg:col-span-7 space-y-4">
+              {/* BANK QR CONFIGURATION PANEL IN LỊCH SỬ BILL */}
+              <div className="bg-white border border-slate-200 rounded-xl p-5">
+                <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-200">
+                  <div>
+                    <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                      <QrCode className="w-4 h-4 text-emerald-600" />
+                      <span>
+                        Cài Đặt Mã QR Chuyển Khoản Ngân Hàng Trên Hóa Đơn
+                      </span>
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Mã QR này được in ở cuối tờ hóa đơn giấy nhiệt (thay cho mã vạch khách hàng cũ) để khách quét chuyển khoản nhanh.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center">
+                  <div className="md:col-span-8 space-y-3 text-xs">
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">
+                        Ngân hàng thụ hưởng (Chuẩn Napas VietQR)
+                      </label>
+                      <select
+                        value={storeProfile.bankBin}
+                        onChange={(e) => {
+                          const found = VIETNAM_BANKS.find(
+                            (b) => b.bin === e.target.value
+                          );
+                          setStoreProfile({
+                            ...storeProfile,
+                            bankBin: e.target.value,
+                            bankShortName: found ? found.shortName : 'VCB',
+                          });
+                        }}
+                        className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg focus:bg-white focus:border-slate-900 focus:outline-none font-medium"
+                      >
+                        {VIETNAM_BANKS.map((bank) => (
+                          <option key={bank.bin} value={bank.bin}>
+                            {bank.shortName} - {bank.fullName}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block font-semibold text-slate-700 mb-1">
+                          Số tài khoản ngân hàng
+                        </label>
+                        <input
+                          type="text"
+                          value={storeProfile.bankAccountNumber}
+                          onChange={(e) =>
+                            setStoreProfile({
+                              ...storeProfile,
+                              bankAccountNumber: e.target.value,
+                            })
+                          }
+                          placeholder="VD: 0123456789"
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg focus:bg-white focus:border-slate-900 focus:outline-none font-mono font-bold text-slate-900"
+                        />
+                      </div>
+                      <div>
+                        <label className="block font-semibold text-slate-700 mb-1">
+                          Tên chủ tài khoản (Không dấu)
+                        </label>
+                        <input
+                          type="text"
+                          value={storeProfile.bankAccountName}
+                          onChange={(e) =>
+                            setStoreProfile({
+                              ...storeProfile,
+                              bankAccountName: e.target.value.toUpperCase(),
+                            })
+                          }
+                          placeholder="VD: TAP HOA DUNG CANH"
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg focus:bg-white focus:border-slate-900 focus:outline-none font-semibold uppercase"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                      <div>
+                        <label className="block font-semibold text-slate-700 mb-1">
+                          Nội dung chuyển khoản tự động
+                        </label>
+                        <input
+                          type="text"
+                          value={storeProfile.bankQrNoteTemplate}
+                          onChange={(e) =>
+                            setStoreProfile({
+                              ...storeProfile,
+                              bankQrNoteTemplate: e.target.value,
+                            })
+                          }
+                          placeholder="VD: TT"
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg focus:bg-white focus:border-slate-900 focus:outline-none"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-slate-700 mb-1">
+                          Hoặc tải ảnh QR riêng từ máy
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <label className="flex-1 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg font-medium flex items-center justify-center gap-1.5 cursor-pointer transition-colors">
+                            <Upload className="w-3.5 h-3.5" />
+                            <span>Chọn ảnh QR...</span>
+                            <input
+                              type="file"
+                              accept="image/*"
+                              onChange={handleUploadCustomQrImage}
+                              className="hidden"
+                            />
+                          </label>
+                          {storeProfile.customQrDataUrl && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setConfirmDialog({
+                                  title: 'Xác nhận xóa ảnh Mã QR',
+                                  message:
+                                    'Bạn có chắc chắn muốn xóa ảnh Mã QR riêng đã tải lên và chuyển về mã VietQR tự động không?',
+                                  confirmLabel: 'Chắc chắn xóa ảnh QR',
+                                  onConfirm: () => {
+                                    setStoreProfile({
+                                      ...storeProfile,
+                                      customQrDataUrl: '',
+                                    });
+                                  },
+                                })
+                              }
+                              className="px-2.5 py-2 text-red-600 bg-red-50 hover:bg-red-100 rounded-lg font-medium cursor-pointer"
+                              title="Xóa ảnh tải lên để dùng VietQR tự động"
+                            >
+                              Xóa ảnh
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Live QR Code Preview Box */}
+                  <div className="md:col-span-4 flex flex-col items-center justify-center bg-slate-50 border border-slate-200 rounded-xl p-3 text-center">
+                    <div className="text-[11px] font-bold text-slate-700 mb-1.5">
+                      Xem trước Mã QR trên Bill
+                    </div>
+                    {previewQrInSettings ? (
+                      <img
+                        src={previewQrInSettings}
+                        alt="Xem trước mã QR ngân hàng"
+                        referrerPolicy="no-referrer"
+                        className="w-32 h-32 object-contain bg-white border border-slate-200 p-1 rounded"
+                      />
+                    ) : (
+                      <div className="w-32 h-32 flex items-center justify-center text-xs text-slate-400">
+                        Nhập số TK
+                      </div>
+                    )}
+                    <div className="text-xs font-bold text-slate-900 mt-1.5">
+                      {storeProfile.bankShortName} ·{' '}
+                      {storeProfile.bankAccountNumber}
+                    </div>
+                    <div className="text-[11px] text-slate-600 uppercase">
+                      {storeProfile.bankAccountName}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Store Thermal Print Header Configuration */}
+              <div className="bg-white border border-slate-200 rounded-xl p-5">
+                <h2 className="text-sm font-bold text-slate-900 mb-3">
+                  Thông Tin Đầu Hóa Đơn Giấy Nhiệt ({storeProfile.storeName})
+                </h2>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                  <div>
+                    <label className="block font-semibold text-slate-600 mb-1">
+                      Tên cửa hàng in trên bill
+                    </label>
+                    <input
+                      type="text"
+                      value={storeProfile.storeName}
+                      onChange={(e) =>
+                        setStoreProfile({
+                          ...storeProfile,
+                          storeName: e.target.value,
+                        })
+                      }
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none font-semibold"
+                    />
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-slate-600 mb-1">
+                      Số điện thoại
+                    </label>
+                    <input
+                      type="text"
+                      value={storeProfile.phone}
+                      onChange={(e) =>
+                        setStoreProfile({
+                          ...storeProfile,
+                          phone: e.target.value,
+                        })
+                      }
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none font-mono"
+                    />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className="block font-semibold text-slate-600 mb-1">
+                      Địa chỉ cửa hàng
+                    </label>
+                    <input
+                      type="text"
+                      value={storeProfile.address}
+                      onChange={(e) =>
+                        setStoreProfile({
+                          ...storeProfile,
+                          address: e.target.value,
+                        })
+                      }
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Invoices Table */}
+              <div className="bg-white border border-slate-200 rounded-xl p-5">
+                <div className="flex items-center justify-between pb-3 mb-3 border-b border-slate-200">
+                  <div>
+                    <h2 className="text-base font-bold text-slate-900">
+                      Lịch Sử Hóa Đơn Đã Lưu ({invoices.length} phiếu)
+                    </h2>
+                    <p className="text-xs text-slate-500">
+                      Bấm vào bất kỳ hóa đơn nào để xem lại và in lại ra máy in giấy nhiệt (kèm mã QR ngân hàng).
+                    </p>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-[11px] text-slate-500">
+                      Tổng doanh thu đã lưu
+                    </div>
+                    <div className="text-base font-bold font-mono tabular-nums text-emerald-700">
+                      {formatVND(
+                        invoices.reduce((s, inv) => s + inv.totalAmount, 0)
+                      )}{' '}
+                      đ
+                    </div>
+                  </div>
+                </div>
+
+                {invoices.length === 0 ? (
+                  <div className="py-10 text-center text-xs text-slate-500">
+                    Chưa có hóa đơn nào được lưu. Khi thanh toán & in ở mục Lên Bill, hóa đơn sẽ tự động lưu tại đây.
+                  </div>
+                ) : (
+                  <div className="divide-y divide-slate-100">
+                    {invoices.map((inv) => {
+                      const isSelected = selectedHistoryInvoice?.id === inv.id;
+                      return (
+                        <div
+                          key={inv.id}
+                          onClick={() => setSelectedHistoryInvoice(inv)}
+                          className={`py-3 px-3 rounded-lg flex items-center justify-between cursor-pointer transition-colors ${
+                            isSelected ? 'bg-emerald-50' : 'hover:bg-slate-50'
+                          }`}
+                        >
+                          <div>
+                            <div className="text-xs font-bold text-slate-900 flex items-center gap-2">
+                              <FileText className="w-3.5 h-3.5 text-emerald-600" />
+                              <span className="font-mono">
+                                {inv.invoiceCode}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span>{inv.customerName}</span>
+                            </div>
+                            <div className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                              {inv.createdAtDate
+                                ? new Intl.DateTimeFormat('vi-VN', {
+                                    day: '2-digit',
+                                    month: '2-digit',
+                                    year: 'numeric',
+                                    hour: '2-digit',
+                                    minute: '2-digit',
+                                  }).format(inv.createdAtDate)
+                                : ''}{' '}
+                              · {inv.itemCount} sản phẩm · Khổ {inv.paperWidth}
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-xs font-bold font-mono tabular-nums text-slate-900">
+                              {formatVND(inv.totalAmount)} đ
+                            </div>
+                            <div className="flex items-center justify-end gap-2 mt-0.5">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedHistoryInvoice(inv);
+                                  setTimeout(() => window.print(), 100);
+                                }}
+                                className="text-[11px] text-emerald-700 hover:underline font-medium inline-flex items-center gap-1 cursor-pointer"
+                              >
+                                <Printer className="w-3 h-3" />
+                                <span>In lại bill</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setConfirmDialog({
+                                    title: 'Xác nhận xóa hóa đơn đã lưu',
+                                    message: `Bạn có chắc chắn muốn xóa hóa đơn "${inv.invoiceCode}" (${formatVND(inv.totalAmount)} đ) khỏi lịch sử không?`,
+                                    confirmLabel: 'Chắc chắn xóa hóa đơn',
+                                    onConfirm: async () => {
+                                      try {
+                                        await deleteDoc(
+                                          doc(db, 'invoices', inv.id)
+                                        );
+                                        if (
+                                          selectedHistoryInvoice?.id === inv.id
+                                        ) {
+                                          setSelectedHistoryInvoice(null);
+                                        }
+                                      } catch (err) {
+                                        handleFirestoreError(
+                                          err,
+                                          OperationType.DELETE,
+                                          `invoices/${inv.id}`
+                                        );
+                                      }
+                                    },
+                                  });
+                                }}
+                                className="text-[11px] text-slate-400 hover:text-red-600 inline-flex items-center gap-0.5 cursor-pointer"
+                                title="Xóa hóa đơn này"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                                <span>Xóa</span>
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Right 5 cols: Selected Historical Receipt Preview (or Live Sample Receipt Preview with Bank QR) */}
+            <div className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-4">
+              {selectedHistoryInvoice ? (
+                <div>
+                  <div className="no-print flex items-center justify-between pb-3 mb-3 border-b border-slate-200">
+                    <span className="text-xs font-bold text-slate-900">
+                      Xem lại phiếu {selectedHistoryInvoice.invoiceCode}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => window.print()}
+                      className="px-3 py-1.5 bg-slate-900 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 hover:bg-slate-800 cursor-pointer"
+                    >
+                      <Printer className="w-3.5 h-3.5" />
+                      <span>In Lại Hóa Đơn Này</span>
+                    </button>
+                  </div>
+                  <ThermalReceipt
+                    invoiceCode={selectedHistoryInvoice.invoiceCode}
+                    tabLabel={selectedHistoryInvoice.tabName}
+                    customerName={selectedHistoryInvoice.customerName}
+                    items={selectedHistoryInvoice.items}
+                    discount={selectedHistoryInvoice.discount}
+                    amountTendered={selectedHistoryInvoice.amountTendered}
+                    storeProfile={storeProfile}
+                    createdAtText={
+                      selectedHistoryInvoice.createdAtDate
+                        ? new Intl.DateTimeFormat('vi-VN', {
+                            day: '2-digit',
+                            month: '2-digit',
+                            year: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          }).format(selectedHistoryInvoice.createdAtDate)
+                        : undefined
+                    }
+                    readOnly={true}
+                  />
+                </div>
+              ) : (
+                <div>
+                  <div className="no-print pb-3 mb-3 border-b border-slate-200 text-xs font-bold text-slate-900">
+                    Xem trước mẫu Hóa Đơn Giấy Nhiệt & Mã QR Ngân Hàng
+                  </div>
+                  <ThermalReceipt
+                    invoiceCode={currentInvoiceCode}
+                    tabLabel={activeOrderTab.label}
+                    customerName={activeOrderTab.customerName}
+                    items={
+                      activeOrderTab.items.length > 0
+                        ? activeOrderTab.items
+                        : [
+                            {
+                              lineId: 'preview_1',
+                              barcode: '8934563138165',
+                              name: 'Mì Hảo Hảo Tôm Chua Cay 75g',
+                              unit: 'Gói',
+                              price: 4500,
+                              quantity: 2,
+                            },
+                            {
+                              lineId: 'preview_2',
+                              barcode: '8935049501015',
+                              name: 'Nước Ngọt Coca-Cola Original Lon 320ml',
+                              unit: 'Lon',
+                              price: 10000,
+                              quantity: 1,
+                            },
+                          ]
+                    }
+                    discount={0}
+                    amountTendered={20000}
+                    storeProfile={storeProfile}
+                    readOnly={true}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Modal for automatic barcode product lookup when scanning an unknown barcode in POS */}
+      {autoModalBarcode !== null && (
+        <div className="no-print fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4 overflow-y-auto">
+          <BarcodeAutoModal
+            initialBarcode={autoModalBarcode}
+            existingProducts={allProducts}
+            onSaveProduct={handleSaveProductToFirestore}
+            onClose={() => setAutoModalBarcode(null)}
+          />
+        </div>
+      )}
+
+      {/* Global Confirmation Modal before deleting anything */}
+      {confirmDialog !== null && (
+        <div className="no-print fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-xl max-w-md w-full p-5 shadow-lg">
+            <div className="flex items-start gap-3">
+              <div className="p-2 bg-red-50 text-red-600 rounded-lg shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-base font-bold text-slate-900">
+                  {confirmDialog.title}
+                </h3>
+                <p className="text-xs text-slate-600 mt-1.5 leading-relaxed">
+                  {confirmDialog.message}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2.5 mt-5 pt-3.5 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setConfirmDialog(null)}
+                className="px-4 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
+              >
+                Hủy bỏ (Không xóa)
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const action = confirmDialog.onConfirm;
+                  setConfirmDialog(null);
+                  await action();
+                }}
+                className="px-4 py-2 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{confirmDialog.confirmLabel || 'Chắc chắn xóa'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

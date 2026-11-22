@@ -1,0 +1,8 @@
+{
+  "name": "Tạp Hóa Dung Cảnh - POS & Quản Lý Mã Vạch",
+  "description": "Phần mềm bán hàng tạp hóa chuyên dụng cho Tạp Hóa Dung Cảnh: quét mã vạch tự động nhận diện thông tin sản phẩm, làm nhiều phiếu cùng lúc, sửa tên hàng trực tiếp trên bill, quản lý kho hàng và in hóa đơn giấy nhiệt cuộn dài.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

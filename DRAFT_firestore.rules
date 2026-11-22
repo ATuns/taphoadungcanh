@@ -1,0 +1,164 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Reusable Hardened Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // 3. Entity Validation Blueprints
+    function isValidProduct(data) {
+      return data.keys().hasAll([
+          'barcode',
+          'name',
+          'category',
+          'unit',
+          'price',
+          'costPrice',
+          'stock',
+          'source',
+          'ownerId',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'barcode',
+          'name',
+          'category',
+          'unit',
+          'price',
+          'costPrice',
+          'stock',
+          'source',
+          'ownerId',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.barcode is string && data.barcode.size() >= 1 && data.barcode.size() <= 64 && data.barcode.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 200
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 100
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 50
+        && data.price is number && data.price >= 0 && data.price <= 1000000000
+        && data.costPrice is number && data.costPrice >= 0 && data.costPrice <= 1000000000
+        && data.stock is number && data.stock >= 0 && data.stock <= 10000000
+        && data.source is string && data.source.size() >= 1 && data.source.size() <= 50
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == request.auth.uid
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInvoice(data) {
+      return data.keys().hasAll([
+          'invoiceCode',
+          'tabName',
+          'customerName',
+          'itemsJson',
+          'itemCount',
+          'subtotal',
+          'discount',
+          'totalAmount',
+          'amountTendered',
+          'changeDue',
+          'paperWidth',
+          'ownerId',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'invoiceCode',
+          'tabName',
+          'customerName',
+          'itemsJson',
+          'itemCount',
+          'subtotal',
+          'discount',
+          'totalAmount',
+          'amountTendered',
+          'changeDue',
+          'paperWidth',
+          'ownerId',
+          'createdAt'
+        ])
+        && data.invoiceCode is string && data.invoiceCode.size() >= 1 && data.invoiceCode.size() <= 64
+        && data.tabName is string && data.tabName.size() >= 1 && data.tabName.size() <= 100
+        && data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 150
+        && data.itemsJson is string && data.itemsJson.size() >= 2 && data.itemsJson.size() <= 4000
+        && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 100000
+        && data.subtotal is number && data.subtotal >= 0 && data.subtotal <= 10000000000
+        && data.discount is number && data.discount >= 0 && data.discount <= 10000000000
+        && data.totalAmount is number && data.totalAmount >= 0 && data.totalAmount <= 10000000000
+        && data.amountTendered is number && data.amountTendered >= 0 && data.amountTendered <= 10000000000
+        && data.changeDue is number && data.changeDue >= 0 && data.changeDue <= 10000000000
+        && data.paperWidth is string && data.paperWidth.size() >= 1 && data.paperWidth.size() <= 10
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == request.auth.uid
+        && data.createdAt is timestamp;
+    }
+
+    // 4. Collection Rules: /products/{productId}
+    match /products/{productId} {
+      allow get: if isSignedIn() && isValidId(productId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isVerifiedUser()
+        && isValidId(productId)
+        && isValidProduct(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(productId)
+        && isValidProduct(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Edit product info, pricing, or stock
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'barcode',
+            'name',
+            'category',
+            'unit',
+            'price',
+            'costPrice',
+            'stock',
+            'source',
+            'updatedAt'
+          ])
+        );
+      allow delete: if isVerifiedUser() && isValidId(productId) && existing().ownerId == request.auth.uid;
+    }
+
+    // 5. Collection Rules: /invoices/{invoiceId}
+    match /invoices/{invoiceId} {
+      allow get: if isSignedIn() && isValidId(invoiceId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isVerifiedUser()
+        && isValidId(invoiceId)
+        && isValidInvoice(incoming())
+        && incoming().createdAt == request.time;
+      // Terminal state locking: Finalized thermal invoices are immutable
+      allow update: if false;
+      allow delete: if isVerifiedUser() && isValidId(invoiceId) && existing().ownerId == request.auth.uid;
+    }
+  }
+}
