@@ -6,7 +6,7 @@ import { put, get, list } from '@vercel/blob';
 import {
   VIETNAM_BARCODE_CATALOG,
   GS1_BRAND_PREFIXES,
-} from '../data/vietnamBarcodes.ts';
+} from '../data/vietnamBarcodes';
 
 const BLOB_PATHNAME = 'taphoadungcanh-blob/database.json';
 const LOCAL_FALLBACK_FILE = path.resolve(
