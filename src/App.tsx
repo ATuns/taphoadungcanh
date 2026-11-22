@@ -117,14 +117,14 @@ export default function App() {
   const [storeProfile, setStoreProfile] = useState<StoreProfile>(() => {
     const defaultProfile: StoreProfile = {
       storeName: 'TẠP HÓA DUNG CẢNH',
-      address: 'Khu dân cư trung tâm · Chuyên sỉ & lẻ tạp hóa',
-      phone: '0905 888 999',
+      address: 'Xóm Trung Cần, Xã Thiên Nhẫn, Nghệ An',
+      phone: '0911490518 - 0915605061',
       footerNote: 'Cảm ơn Quý Khách · Hẹn gặp lại!',
       paperWidth: '80mm',
-      bankBin: '970436',
-      bankShortName: 'VCB',
-      bankAccountNumber: '0123456789',
-      bankAccountName: 'TAP HOA DUNG CANH',
+      bankBin: '970422',
+      bankShortName: 'MB',
+      bankAccountNumber: '0911490518',
+      bankAccountName: 'NGUYEN XUAN CANH',
       bankQrNoteTemplate: 'TT',
       customQrDataUrl: '',
     };
@@ -366,6 +366,12 @@ export default function App() {
       setBlobConnected(Boolean(data?.blobConnected));
       if (data?.storeId) {
         setBlobStoreId(String(data.storeId));
+      }
+
+      // If the serverless container cold-started without persisted Blob data (hasPersistedData === false),
+      // do NOT overwrite the browser's saved localStorage state on F5 reload!
+      if (!data?.hasPersistedData) {
+        return;
       }
 
       if (data?.storeProfile) {

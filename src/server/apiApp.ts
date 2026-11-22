@@ -96,6 +96,7 @@ export interface TapHoaBlobDatabase {
   version: number;
   storeId: string;
   updatedAtIso: string;
+  hasPersistedData?: boolean;
   adminCredential?: EncryptedAdminCredential | null;
   storeProfile: BlobStoreProfile;
   products: Record<string, BlobProductRecord>;
@@ -108,14 +109,14 @@ export interface TapHoaBlobDatabase {
 
 const DEFAULT_STORE_PROFILE: BlobStoreProfile = {
   storeName: 'TẠP HÓA DUNG CẢNH',
-  address: 'Khu dân cư trung tâm · Chuyên sỉ & lẻ tạp hóa',
-  phone: '0905 888 999',
+  address: 'Xóm Trung Cần, Xã Thiên Nhẫn, Nghệ An',
+  phone: '0911490518 - 0915605061',
   footerNote: 'Cảm ơn Quý Khách · Hẹn gặp lại!',
   paperWidth: '80mm',
-  bankBin: '970436',
-  bankShortName: 'VCB',
-  bankAccountNumber: '0123456789',
-  bankAccountName: 'TAP HOA DUNG CANH',
+  bankBin: '970422',
+  bankShortName: 'MB',
+  bankAccountNumber: '0911490518',
+  bankAccountName: 'NGUYEN XUAN CANH',
   bankQrNoteTemplate: 'TT',
   customQrDataUrl: '',
 };
@@ -124,7 +125,8 @@ function createEmptyDatabase(): TapHoaBlobDatabase {
   return {
     version: 1,
     storeId: process.env.BLOB_STORE_ID || 'taphoadungcanh-blob',
-    updatedAtIso: new Date().toISOString(),
+    updatedAtIso: '',
+    hasPersistedData: false,
     adminCredential: null,
     storeProfile: { ...DEFAULT_STORE_PROFILE },
     products: {},
@@ -297,6 +299,7 @@ async function loadBlobDatabase(
         cachedDb = {
           ...createEmptyDatabase(),
           ...parsed,
+          hasPersistedData: true,
           storeProfile: {
             ...DEFAULT_STORE_PROFILE,
             ...(parsed.storeProfile || {}),
@@ -324,6 +327,7 @@ async function loadBlobDatabase(
       cachedDb = {
         ...createEmptyDatabase(),
         ...parsed,
+        hasPersistedData: true,
         storeProfile: {
           ...DEFAULT_STORE_PROFILE,
           ...(parsed.storeProfile || {}),
@@ -372,6 +376,7 @@ async function saveBlobDatabase(dbData: TapHoaBlobDatabase): Promise<{
   blobUrl?: string;
 }> {
   dbData.updatedAtIso = new Date().toISOString();
+  dbData.hasPersistedData = true;
   dbData.storeId = process.env.BLOB_STORE_ID || 'taphoadungcanh-blob';
   dbData.products = pruneUnmodifiedDefaultCatalogDuplicates(dbData.products);
   cachedDb = dbData;
@@ -716,6 +721,7 @@ export function createApiRouter() {
       return res.json({
         storeId: dbData.storeId,
         updatedAtIso: dbData.updatedAtIso,
+        hasPersistedData: Boolean(dbData.hasPersistedData),
         blobConnected: Boolean(getBlobToken()),
         storeProfile: dbData.storeProfile,
         products: Object.values(dbData.products),
