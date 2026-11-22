@@ -26,6 +26,10 @@ import {
   Copy,
   RefreshCw,
   Download,
+  Lock,
+  LogOut,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import {
   Product,
@@ -110,9 +114,23 @@ function filterModifiedOrCustomProducts(products: Product[]): Product[] {
   });
 }
 
+const ADMIN_SESSION_STORAGE_KEY = 'dung_canh_admin_session_token_v2';
+const FIXED_ADMIN_PASSWORD = 'dungcanh@123';
+
 export default function App() {
-  // Vercel Blob Store (taphoadungcanh-blob) Direct Shared Database State (No password required)
-  const sessionToken = 'shared-taphoadungcanh-blob';
+  // Mandatory Admin Authentication State per device
+  const [sessionToken, setSessionToken] = useState<string>(() => {
+    try {
+      return localStorage.getItem(ADMIN_SESSION_STORAGE_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
+  const [loginPassword, setLoginPassword] = useState<string>('');
+  const [showLoginPassword, setShowLoginPassword] = useState<boolean>(false);
+  const [loginError, setLoginError] = useState<string>('');
+  const [isLoggingIn, setIsLoggingIn] = useState<boolean>(false);
+
   const [blobConnected, setBlobConnected] = useState(false);
   const [blobStoreId, setBlobStoreId] = useState('taphoadungcanh-blob');
   const [authError, setAuthError] = useState<string>('');
@@ -583,15 +601,23 @@ export default function App() {
 
   // 1. Fetch Database State from both /api/db/state (Vercel Blob) and Cloud Firestore (taphoadungcanh_blob/database)
   const fetchBlobDatabaseState = async (
-    _tokenToUse?: string,
+    tokenToUse?: string,
     forceRefresh = false,
     isBackgroundPoll = false
   ) => {
+    const activeToken = tokenToUse || sessionToken;
+    if (!activeToken) return;
+
     try {
       const [apiRes, firestoreSnap] = await Promise.all([
         fetch(
           `/api/db/state?refresh=${forceRefresh ? '1' : '0'}&t=${Date.now()}`,
-          { cache: 'no-store' }
+          {
+            cache: 'no-store',
+            headers: {
+              Authorization: `Bearer ${activeToken}`,
+            },
+          }
         ).catch(() => null),
         pullStateFromCloudFirestore(),
       ]);
@@ -626,9 +652,11 @@ export default function App() {
     }
   };
 
-  // Auto-pull and subscribe in real-time to taphoadungcanh-blob across all devices and deployments
+  // Auto-pull and subscribe in real-time to taphoadungcanh-blob across all devices and deployments once logged in
   useEffect(() => {
-    fetchBlobDatabaseState(undefined, true, false);
+    if (!sessionToken) return;
+
+    fetchBlobDatabaseState(sessionToken, true, false);
 
     // Real-time push listener across AI Studio Preview, GitHub, Vercel, Computer, and Phone
     const unsubscribeFirestore = subscribeToCloudFirestore(
@@ -640,7 +668,7 @@ export default function App() {
 
     const onFocusOrVisible = () => {
       if (document.visibilityState === 'visible') {
-        fetchBlobDatabaseState(undefined, true, true);
+        fetchBlobDatabaseState(sessionToken, true, true);
       }
     };
     window.addEventListener('focus', onFocusOrVisible);
@@ -648,7 +676,7 @@ export default function App() {
 
     const pollTimer = window.setInterval(() => {
       if (document.visibilityState === 'visible') {
-        fetchBlobDatabaseState(undefined, true, true);
+        fetchBlobDatabaseState(sessionToken, true, true);
       }
     }, 4000);
 
@@ -658,7 +686,82 @@ export default function App() {
       document.removeEventListener('visibilitychange', onFocusOrVisible);
       window.clearInterval(pollTimer);
     };
-  }, []);
+  }, [sessionToken]);
+
+  const handleAdminLoginSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const entered = loginPassword.trim();
+    if (!entered) {
+      setLoginError('Vui lòng nhập mật khẩu Admin để truy cập hệ thống.');
+      return;
+    }
+
+    setIsLoggingIn(true);
+    setLoginError('');
+
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passcode: entered }),
+      }).catch(() => null);
+
+      if (res && res.ok) {
+        const data = await parseApiJson(res);
+        const token = String(data?.token || 'admin-authenticated-dungcanh');
+        try {
+          localStorage.setItem(ADMIN_SESSION_STORAGE_KEY, token);
+        } catch {
+          // Ignore storage error
+        }
+        setSessionToken(token);
+        setLoginPassword('');
+        setLoginError('');
+        return;
+      }
+
+      if (res && res.status === 401) {
+        setLoginError('Mật khẩu Admin không chính xác. Vui lòng kiểm tra lại.');
+        return;
+      }
+
+      // Fallback verification for static GitHub Pages deployments where /api/auth/login is not running
+      if (entered === FIXED_ADMIN_PASSWORD) {
+        const fallbackToken = 'admin-authenticated-dungcanh';
+        try {
+          localStorage.setItem(ADMIN_SESSION_STORAGE_KEY, fallbackToken);
+        } catch {
+          // Ignore storage error
+        }
+        setSessionToken(fallbackToken);
+        setLoginPassword('');
+        setLoginError('');
+      } else {
+        setLoginError('Mật khẩu Admin không chính xác. Vui lòng kiểm tra lại.');
+      }
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleAdminLogout = () => {
+    setConfirmDialog({
+      title: 'Xác nhận đăng xuất tài khoản Admin',
+      message:
+        'Bạn có chắc chắn muốn đăng xuất khỏi thiết bị này không? Lần mở tiếp theo trên thiết bị này sẽ cần nhập lại mật khẩu Admin.',
+      confirmLabel: 'Đăng xuất ngay',
+      onConfirm: () => {
+        try {
+          localStorage.removeItem(ADMIN_SESSION_STORAGE_KEY);
+        } catch {
+          // Ignore
+        }
+        setSessionToken('');
+        setLoginPassword('');
+        setLoginError('');
+      },
+    });
+  };
 
   // Auto-push POS order tab edits ONLY when the user has actually edited tabs on this device (never overwrite products on page open!)
   useEffect(() => {
@@ -1796,6 +1899,88 @@ export default function App() {
     activeTabSubtotal - (activeOrderTab.discount || 0)
   );
 
+  if (!sessionToken) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-100 px-4 py-10 text-slate-900">
+        <div className="w-full max-w-md bg-white border border-slate-200 rounded-2xl shadow-lg p-7">
+          <div className="flex flex-col items-center text-center mb-6">
+            <div className="w-12 h-12 rounded-xl bg-emerald-600 text-white flex items-center justify-center mb-3 shadow-sm">
+              <Lock className="w-6 h-6" />
+            </div>
+            <h1 className="text-xl font-bold tracking-tight text-slate-900">
+              Tạp Hóa Dung Cảnh
+            </h1>
+            <p className="text-xs text-slate-500 mt-1">
+              Đăng nhập Quản trị viên (Admin) để truy cập Kho Hàng & Bàn Thu Ngân
+            </p>
+          </div>
+
+          <form onSubmit={handleAdminLoginSubmit} className="space-y-4">
+            <div>
+              <label
+                htmlFor="admin-password-input"
+                className="block text-xs font-semibold text-slate-700 mb-1.5"
+              >
+                Mật khẩu Admin
+              </label>
+              <div className="relative">
+                <input
+                  id="admin-password-input"
+                  type={showLoginPassword ? 'text' : 'password'}
+                  value={loginPassword}
+                  onChange={(e) => {
+                    setLoginPassword(e.target.value);
+                    if (loginError) setLoginError('');
+                  }}
+                  placeholder="Nhập mật khẩu quản trị..."
+                  autoFocus
+                  autoComplete="current-password"
+                  className="w-full px-3.5 py-2.5 pr-10 text-sm bg-slate-50 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:bg-white transition-all"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowLoginPassword((prev) => !prev)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 cursor-pointer"
+                  title={showLoginPassword ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
+                >
+                  {showLoginPassword ? (
+                    <EyeOff className="w-4 h-4" />
+                  ) : (
+                    <Eye className="w-4 h-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {loginError && (
+              <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 shrink-0 text-red-600" />
+                <span>{loginError}</span>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={isLoggingIn}
+              className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white text-sm font-semibold rounded-xl shadow-sm transition-colors flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Lock className="w-4 h-4" />
+              <span>{isLoggingIn ? 'Đang xác thực...' : 'Đăng Nhập Hệ Thống'}</span>
+            </button>
+          </form>
+
+          <div className="mt-6 pt-4 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
+            <span className="flex items-center gap-1.5">
+              <Database className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Kho dữ liệu: taphoadungcanh-blob</span>
+            </span>
+            <span>Bảo mật thiết bị mới</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
       {/* STRICT 3-ZONE TOP BAR CONTRACT */}
@@ -1872,8 +2057,8 @@ export default function App() {
           </a>
         </nav>
 
-        {/* Zone 3: 1 primary action */}
-        <div className="flex items-center shrink-0">
+        {/* Zone 3: Primary action & Logout */}
+        <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
             disabled={isBackupWorking}
@@ -1885,6 +2070,14 @@ export default function App() {
               className={`w-3.5 h-3.5 ${isBackupWorking ? 'animate-spin' : ''}`}
             />
             <span>Cập Nhật Bản Lưu</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleAdminLogout}
+            className="p-2 text-slate-500 hover:text-red-600 hover:bg-slate-100 rounded-lg transition-colors shrink-0 cursor-pointer"
+            title="Đăng xuất Admin khỏi thiết bị này"
+          >
+            <LogOut className="w-4 h-4" />
           </button>
         </div>
       </header>
