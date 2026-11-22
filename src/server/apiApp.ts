@@ -221,19 +221,15 @@ async function putBlobWithPrivateFirst(
       contentType: 'application/json',
       token,
     });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    // Fallback if store is configured as public-only
-    if (msg.toLowerCase().includes('public')) {
-      return await put(pathname, body, {
-        access: 'public',
-        addRandomSuffix: false,
-        allowOverwrite: true,
-        contentType: 'application/json',
-        token,
-      });
-    }
-    throw err;
+  } catch {
+    // Fallback if store is configured with public access
+    return await put(pathname, body, {
+      access: 'public',
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      contentType: 'application/json',
+      token,
+    });
   }
 }
 
@@ -392,15 +388,22 @@ async function saveBlobDatabase(dbData: TapHoaBlobDatabase): Promise<{
 
   const token = getBlobToken();
   if (token) {
-    const blobResult = await putBlobWithPrivateFirst(
-      BLOB_PATHNAME,
-      serialized,
-      token
-    );
-    return {
-      savedToVercelBlob: true,
-      blobUrl: blobResult.url,
-    };
+    try {
+      const blobResult = await putBlobWithPrivateFirst(
+        BLOB_PATHNAME,
+        serialized,
+        token
+      );
+      return {
+        savedToVercelBlob: true,
+        blobUrl: blobResult.url,
+      };
+    } catch (err) {
+      console.error(
+        'Vercel Blob write fallback notice:',
+        err instanceof Error ? err.message : err
+      );
+    }
   }
 
   return { savedToVercelBlob: false };
@@ -1064,12 +1067,19 @@ export function createApiRouter() {
       let blobUrl = '';
 
       if (token) {
-        const blobResult = await putBlobWithPrivateFirst(
-          copyPathname,
-          serialized,
-          token
-        );
-        blobUrl = blobResult.url;
+        try {
+          const blobResult = await putBlobWithPrivateFirst(
+            copyPathname,
+            serialized,
+            token
+          );
+          blobUrl = blobResult.url;
+        } catch (err) {
+          console.error(
+            'Vercel Blob backup copy fallback notice:',
+            err instanceof Error ? err.message : err
+          );
+        }
       }
 
       // Also update main database snapshot

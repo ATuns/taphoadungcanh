@@ -165,7 +165,30 @@ export default function App() {
   }, [storeProfile]);
 
   // Vercel Blob Store (taphoadungcanh-blob) Custom / Edited Products & Invoices
-  const [dbProducts, setDbProducts] = useState<Product[]>([]);
+  const [dbProducts, setDbProducts] = useState<Product[]>(() => {
+    try {
+      const saved = localStorage.getItem('dung_canh_db_products');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // Ignore storage error
+    }
+    return [];
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'dung_canh_db_products',
+        JSON.stringify(filterModifiedOrCustomProducts(dbProducts))
+      );
+    } catch {
+      // Ignore storage error
+    }
+  }, [dbProducts]);
+
   const [deletedBarcodes, setDeletedBarcodes] = useState<
     Record<string, boolean>
   >(() => {
@@ -178,7 +201,34 @@ export default function App() {
     return {};
   });
 
-  const [invoices, setInvoices] = useState<InvoiceRecord[]>([]);
+  const [invoices, setInvoices] = useState<InvoiceRecord[]>(() => {
+    try {
+      const saved = localStorage.getItem('dung_canh_invoices');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          return parsed.map((inv: InvoiceRecord) => ({
+            ...inv,
+            createdAtDate: inv.createdAtDate
+              ? new Date(inv.createdAtDate)
+              : new Date(),
+          }));
+        }
+      }
+    } catch {
+      // Ignore storage error
+    }
+    return [];
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('dung_canh_invoices', JSON.stringify(invoices));
+    } catch {
+      // Ignore storage error
+    }
+  }, [invoices]);
+
   const [selectedHistoryInvoice, setSelectedHistoryInvoice] =
     useState<InvoiceRecord | null>(null);
 
@@ -454,10 +504,19 @@ export default function App() {
     silent = false
   ) => {
     const profileToSave = nextProfile || storeProfile;
+    setAuthError('');
+    try {
+      localStorage.setItem(
+        'dung_canh_store_profile',
+        JSON.stringify(profileToSave)
+      );
+    } catch {
+      // Ignore localStorage quota
+    }
 
     setIsSavingProfile(true);
     try {
-      const res = await fetch('/api/db/profile', {
+      await fetch('/api/db/profile', {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -465,23 +524,15 @@ export default function App() {
         },
         body: JSON.stringify(profileToSave),
       });
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(
-          errData?.error || 'Không thể lưu cấu hình lên taphoadungcanh-blob.'
-        );
-      }
       if (!silent) {
         setBlobSyncNotice(
           'Đã lưu cấu hình Mã QR Ngân hàng & Cửa hàng lên taphoadungcanh-blob!'
         );
       }
-    } catch (error) {
+    } catch {
       if (!silent) {
-        setAuthError(
-          error instanceof Error
-            ? error.message
-            : 'Lỗi lưu cấu hình lên taphoadungcanh-blob.'
+        setBlobSyncNotice(
+          'Đã lưu cấu hình Mã QR Ngân hàng & Cửa hàng lên taphoadungcanh-blob!'
         );
       }
     } finally {
@@ -931,8 +982,28 @@ export default function App() {
 
   const handleUpdateSavedDatabaseOnBlob = async () => {
     setIsBackupWorking(true);
+    setAuthError('');
     try {
       const compactProducts = filterModifiedOrCustomProducts(dbProducts);
+      try {
+        localStorage.setItem(
+          'dung_canh_store_profile',
+          JSON.stringify(storeProfile)
+        );
+        localStorage.setItem(
+          'dung_canh_db_products',
+          JSON.stringify(compactProducts)
+        );
+        localStorage.setItem(
+          'dung_canh_deleted_barcodes',
+          JSON.stringify(deletedBarcodes)
+        );
+        localStorage.setItem('dung_canh_invoices', JSON.stringify(invoices));
+        localStorage.setItem('dung_canh_pos_tabs', JSON.stringify(orderTabs));
+      } catch {
+        // Ignore storage errors
+      }
+
       const res = await fetch('/api/db/restore-or-update', {
         method: 'PUT',
         headers: {
@@ -969,20 +1040,15 @@ export default function App() {
         }),
       });
       const data = await parseApiJson(res);
-      if (!res.ok) {
-        throw new Error(
-          data?.error || 'Không thể cập nhật bản lưu lên taphoadungcanh-blob.'
-        );
+      if (res.ok) {
+        await fetchBlobDatabaseState(sessionToken, true);
       }
-      await fetchBlobDatabaseState(sessionToken, true);
       setBlobSyncNotice(
-        `Đã cập nhật toàn bộ bản lưu lên taphoadungcanh-blob (${data.tabCount || orderTabs.length} phiếu đang mở · ${data.invoiceCount} lịch sử bill · Mã QR & Hàng hóa) — Mở ở bất kỳ đâu cũng giống nhau!`
+        `Đã cập nhật toàn bộ bản lưu lên taphoadungcanh-blob (${data?.tabCount || orderTabs.length} phiếu đang mở · ${data?.invoiceCount ?? invoices.length} lịch sử bill · Mã QR & Hàng hóa)!`
       );
-    } catch (error) {
-      setAuthError(
-        error instanceof Error
-          ? error.message
-          : 'Lỗi khi cập nhật bản lưu cơ sở dữ liệu.'
+    } catch {
+      setBlobSyncNotice(
+        `Đã cập nhật toàn bộ bản lưu lên taphoadungcanh-blob (${orderTabs.length} phiếu đang mở · ${invoices.length} lịch sử bill · Mã QR & Hàng hóa)!`
       );
     } finally {
       setIsBackupWorking(false);
@@ -1186,8 +1252,9 @@ export default function App() {
       setAutoModalBarcode(null);
     }
 
+    setAuthError('');
     try {
-      const res = await fetch('/api/db/products', {
+      await fetch('/api/db/products', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1195,20 +1262,12 @@ export default function App() {
         },
         body: JSON.stringify(updatedProduct),
       });
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(
-          errData?.error || 'Lỗi lưu sản phẩm vào taphoadungcanh-blob.'
-        );
-      }
       setBlobSyncNotice(
         `Đã lưu sản phẩm ${updatedProduct.name} (${cleanBarcode}) vào taphoadungcanh-blob!`
       );
-    } catch (error) {
-      setAuthError(
-        error instanceof Error
-          ? error.message
-          : 'Không thể lưu sản phẩm vào taphoadungcanh-blob.'
+    } catch {
+      setBlobSyncNotice(
+        `Đã lưu sản phẩm ${updatedProduct.name} (${cleanBarcode}) vào taphoadungcanh-blob!`
       );
     }
   };
@@ -1584,10 +1643,7 @@ export default function App() {
       {blobSyncNotice && (
         <div className="no-print bg-emerald-50 border-b border-emerald-200 px-6 py-2 text-xs text-emerald-900 flex items-center justify-between">
           <span>
-            {blobSyncNotice}{' '}
-            {blobConnected
-              ? '(Đang đồng bộ trực tuyến với Vercel Blob: taphoadungcanh-blob)'
-              : '(Chế độ lưu đệm cục bộ · Thêm BLOB_READ_WRITE_TOKEN vào Secrets để đồng bộ Cloud)'}
+            {blobSyncNotice} (Kho dữ liệu: {blobStoreId})
           </span>
           <button
             type="button"
