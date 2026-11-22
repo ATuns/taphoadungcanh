@@ -320,19 +320,8 @@ function verifySessionToken(token: string): boolean {
   }
 }
 
-function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const authHeader = req.headers.authorization || '';
-  if (!authHeader.startsWith('Bearer ')) {
-    return res
-      .status(401)
-      .json({ error: 'Vui lòng mở khóa phiên làm việc của cửa hàng để lưu dữ liệu.' });
-  }
-  const token = authHeader.slice(7).trim();
-  if (!verifySessionToken(token)) {
-    return res
-      .status(401)
-      .json({ error: 'Phiên làm việc đã hết hạn, vui lòng đăng nhập lại.' });
-  }
+function requireAuth(_req: Request, _res: Response, next: NextFunction) {
+  // Single shared store database (taphoadungcanh-blob) without password prompt as requested
   next();
 }
 

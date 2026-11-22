@@ -11,8 +11,6 @@ import {
   Printer,
   Search,
   PackagePlus,
-  LogIn,
-  LogOut,
   Edit3,
   Check,
   X,
@@ -24,7 +22,6 @@ import {
   ChevronRight,
   Database,
   AlertTriangle,
-  KeyRound,
   Save,
   Copy,
   RefreshCw,
@@ -72,16 +69,10 @@ function createEmptyOrderTab(tabNumber: number): PosOrderTab {
 }
 
 export default function App() {
-  // Vercel Blob Store (taphoadungcanh-blob) Authentication & Session State
-  // Security rule: Hold Bearer token strictly in memory (never in localStorage or sessionStorage)
-  const [sessionToken, setSessionToken] = useState<string | null>(null);
-  const [isAuthReady, setIsAuthReady] = useState(false);
-  const [isClaimed, setIsClaimed] = useState(false);
+  // Vercel Blob Store (taphoadungcanh-blob) Direct Shared Database State (No password required)
+  const sessionToken = 'shared-taphoadungcanh-blob';
   const [blobConnected, setBlobConnected] = useState(false);
   const [blobStoreId, setBlobStoreId] = useState('taphoadungcanh-blob');
-  const [passcodeInput, setPasscodeInput] = useState('');
-  const [isAuthenticating, setIsAuthenticating] = useState(false);
-  const [showAuthModal, setShowAuthModal] = useState(false);
   const [authError, setAuthError] = useState<string>('');
   const [blobSyncNotice, setBlobSyncNotice] = useState<string>('');
 
@@ -277,50 +268,21 @@ export default function App() {
 
   const scannerInputRef = useRef<HTMLInputElement>(null);
 
-  // 1. Check Blob Store & Admin Credential Status on Mount
-  useEffect(() => {
-    let mounted = true;
-    fetch('/api/auth/status')
-      .then((res) => res.json())
-      .then((data) => {
-        if (!mounted) return;
-        setIsClaimed(Boolean(data?.isClaimed));
-        setBlobConnected(Boolean(data?.blobConnected));
-        if (data?.blobStoreId) {
-          setBlobStoreId(String(data.blobStoreId));
-        }
-        setIsAuthReady(true);
-      })
-      .catch(() => {
-        if (!mounted) return;
-        setIsAuthReady(true);
-      });
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
-  // 2. Fetch Database State from Vercel Blob Store (taphoadungcanh-blob) when authenticated
+  // 1. Fetch Database State directly from shared Vercel Blob Store (taphoadungcanh-blob) on Mount
   const fetchBlobDatabaseState = async (
-    tokenToUse: string,
+    _tokenToUse?: string,
     forceRefresh = false
   ) => {
     try {
       const res = await fetch(
-        `/api/db/state${forceRefresh ? '?refresh=1' : ''}`,
-        {
-          headers: {
-            Authorization: `Bearer ${tokenToUse}`,
-          },
-        }
+        `/api/db/state${forceRefresh ? '?refresh=1' : ''}`
       );
-      if (res.status === 401) {
-        setSessionToken(null);
-        return;
-      }
       if (!res.ok) return;
       const data = await res.json();
       setBlobConnected(Boolean(data?.blobConnected));
+      if (data?.storeId) {
+        setBlobStoreId(String(data.storeId));
+      }
 
       if (data?.storeProfile) {
         setStoreProfile((prev) => ({
@@ -395,61 +357,8 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (sessionToken) {
-      fetchBlobDatabaseState(sessionToken, true);
-    }
-  }, [sessionToken]);
-
-  // Claim or Sign In to Vercel Blob Store (taphoadungcanh-blob)
-  const handleClaimOrLoginBlobStore = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    const cleanPass = passcodeInput.trim();
-    if (cleanPass.length < 4) {
-      setAuthError('Vui lòng nhập mật khẩu quản lý cửa hàng (từ 4 ký tự).');
-      return;
-    }
-
-    setAuthError('');
-    setIsAuthenticating(true);
-    try {
-      const endpoint = isClaimed ? '/api/auth/login' : '/api/auth/claim';
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passcode: cleanPass }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setAuthError(
-          data?.error || 'Không thể mở khóa kho dữ liệu taphoadungcanh-blob.'
-        );
-        return;
-      }
-
-      if (data?.token) {
-        setSessionToken(String(data.token));
-        setIsClaimed(true);
-        setPasscodeInput('');
-        setShowAuthModal(false);
-        setBlobSyncNotice(
-          'Đã kết nối & mở khóa cơ sở dữ liệu taphoadungcanh-blob thành công!'
-        );
-      }
-    } catch (error) {
-      setAuthError(
-        error instanceof Error
-          ? error.message
-          : 'Lỗi kết nối đến máy chủ Blob Store.'
-      );
-    } finally {
-      setIsAuthenticating(false);
-    }
-  };
-
-  const handleSignOut = () => {
-    setSessionToken(null);
-    setBlobSyncNotice('Đã khóa phiên kết nối cơ sở dữ liệu taphoadungcanh-blob.');
-  };
+    fetchBlobDatabaseState(undefined, true);
+  }, []);
 
   // Save Store Profile & Bank QR Configuration to Vercel Blob Store
   const handleSaveProfileToBlobStore = async (
@@ -457,15 +366,6 @@ export default function App() {
     silent = false
   ) => {
     const profileToSave = nextProfile || storeProfile;
-    if (!sessionToken) {
-      if (!silent) {
-        setShowAuthModal(true);
-        setAuthError(
-          'Vui lòng mở khóa mật khẩu cửa hàng để lưu cấu hình Mã QR & Cửa hàng lên taphoadungcanh-blob.'
-        );
-      }
-      return;
-    }
 
     setIsSavingProfile(true);
     try {
@@ -902,14 +802,6 @@ export default function App() {
   };
 
   const handleUpdateSavedDatabaseOnBlob = async () => {
-    if (!sessionToken) {
-      setShowAuthModal(true);
-      setAuthError(
-        'Vui lòng mở khóa mật khẩu cửa hàng để cập nhật bản lưu lên taphoadungcanh-blob.'
-      );
-      return;
-    }
-
     setIsBackupWorking(true);
     try {
       const res = await fetch('/api/db/restore-or-update', {
@@ -1161,14 +1053,6 @@ export default function App() {
       setAutoModalBarcode(null);
     }
 
-    if (!sessionToken) {
-      setShowAuthModal(true);
-      setAuthError(
-        'Vui lòng mở khóa mật khẩu cửa hàng để lưu vĩnh viễn sản phẩm vào taphoadungcanh-blob.'
-      );
-      return;
-    }
-
     try {
       const res = await fetch('/api/db/products', {
         method: 'POST',
@@ -1400,13 +1284,6 @@ export default function App() {
 
   // Batch sync current page of products to Vercel Blob Store (taphoadungcanh-blob)
   const handleBatchSyncVisiblePageToBlobStore = async () => {
-    if (!sessionToken) {
-      setShowAuthModal(true);
-      setAuthError(
-        'Vui lòng mở khóa mật khẩu cửa hàng để đồng bộ lên taphoadungcanh-blob.'
-      );
-      return;
-    }
     setIsBatchSyncing(true);
     try {
       const res = await fetch('/api/db/products/batch', {
@@ -1556,71 +1433,20 @@ export default function App() {
 
         {/* Zone 3: 1 primary action */}
         <div className="flex items-center shrink-0">
-          {sessionToken ? (
-            <button
-              type="button"
-              onClick={handleSignOut}
-              className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-              title={`Đã kết nối Blob Store: ${blobStoreId}`}
-            >
-              <LogOut className="w-3.5 h-3.5" />
-              <span>Khóa Kho Blob</span>
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={() => setShowAuthModal(true)}
-              className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-            >
-              <LogIn className="w-3.5 h-3.5" />
-              <span>
-                {isClaimed ? 'Mở Khóa Blob Store' : 'Tạo Mật Khẩu Kho Blob'}
-              </span>
-            </button>
-          )}
+          <button
+            type="button"
+            disabled={isBackupWorking}
+            onClick={handleUpdateSavedDatabaseOnBlob}
+            className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+            title={`Kho dữ liệu chung: ${blobStoreId}`}
+          >
+            <RefreshCw
+              className={`w-3.5 h-3.5 ${isBackupWorking ? 'animate-spin' : ''}`}
+            />
+            <span>Cập Nhật Bản Lưu</span>
+          </button>
         </div>
       </header>
-
-      {/* Inline Blob Store Unlock / First-Run Claim Banner when not unlocked */}
-      {isAuthReady && !sessionToken && (
-        <div className="no-print bg-amber-50 border-b border-amber-200 px-6 py-2.5 flex flex-wrap items-center justify-between gap-4">
-          <div className="text-xs text-amber-950">
-            <span className="font-bold">
-              Cơ sở dữ liệu Vercel Blob Store (taphoadungcanh-blob):
-            </span>{' '}
-            {isClaimed
-              ? 'Nhập mật khẩu quản lý cửa hàng để đồng bộ giá bán lẻ, tồn kho và hóa đơn trực tiếp lên taphoadungcanh-blob.'
-              : 'Lần đầu sử dụng: Tạo mật khẩu quản lý cửa hàng (từ 4 ký tự) để kích hoạt lưu trữ tự động vào taphoadungcanh-blob.'}
-          </div>
-          <form
-            onSubmit={handleClaimOrLoginBlobStore}
-            className="flex items-center gap-2"
-          >
-            <input
-              type="password"
-              value={passcodeInput}
-              onChange={(e) => setPasscodeInput(e.target.value)}
-              placeholder={
-                isClaimed
-                  ? 'Nhập mật khẩu cửa hàng...'
-                  : 'Đặt mật khẩu mới (VD: 1234)...'
-              }
-              className="px-3 py-1.5 text-xs bg-white border border-amber-300 rounded-lg focus:border-slate-900 focus:outline-none w-52"
-            />
-            <button
-              type="submit"
-              disabled={isAuthenticating}
-              className="px-3.5 py-1.5 bg-slate-900 text-white text-xs font-semibold rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              {isAuthenticating
-                ? 'Đang kết nối...'
-                : isClaimed
-                  ? 'Mở Khóa Ngay'
-                  : 'Kích Hoạt & Lưu Blob'}
-            </button>
-          </form>
-        </div>
-      )}
 
       {blobSyncNotice && (
         <div className="no-print bg-emerald-50 border-b border-emerald-200 px-6 py-2 text-xs text-emerald-900 flex items-center justify-between">
@@ -3218,81 +3044,6 @@ export default function App() {
             onSaveProduct={handleSaveProductToBlobStore}
             onClose={() => setAutoModalBarcode(null)}
           />
-        </div>
-      )}
-
-      {/* Modal for Unlocking / Claiming Vercel Blob Store (taphoadungcanh-blob) */}
-      {showAuthModal && (
-        <div className="no-print fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-xl max-w-md w-full p-5 shadow-lg">
-            <div className="flex items-start justify-between gap-3 pb-3 mb-4 border-b border-slate-200">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 bg-emerald-50 text-emerald-700 rounded-lg">
-                  <KeyRound className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="text-base font-bold text-slate-900">
-                    {isClaimed
-                      ? 'Mở Khóa Kho Dữ Liệu taphoadungcanh-blob'
-                      : 'Thiết Lập Mật Khẩu Kho taphoadungcanh-blob'}
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Vercel Blob Store · ID: {blobStoreId}
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowAuthModal(false)}
-                className="text-slate-400 hover:text-slate-700"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <form onSubmit={handleClaimOrLoginBlobStore} className="space-y-4">
-              <p className="text-xs text-slate-600 leading-relaxed">
-                {isClaimed
-                  ? 'Nhập mật khẩu quản lý cửa hàng đã tạo để đồng bộ hóa đơn, giá bán lẻ, tồn kho và cấu hình Mã QR với taphoadungcanh-blob.'
-                  : 'Lần đầu kết nối với taphoadungcanh-blob: Hãy đặt mật khẩu quản lý cửa hàng (từ 4 ký tự). Mật khẩu này được mã hóa bảo mật (AES-256-GCM + Scrypt) trực tiếp vào Blob Store.'}
-              </p>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Mật khẩu quản lý cửa hàng
-                </label>
-                <input
-                  type="password"
-                  autoFocus
-                  value={passcodeInput}
-                  onChange={(e) => setPasscodeInput(e.target.value)}
-                  placeholder="Nhập mật khẩu (tối thiểu 4 ký tự)..."
-                  className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-lg focus:bg-white focus:border-emerald-600 focus:outline-none"
-                />
-              </div>
-
-              <div className="flex items-center justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowAuthModal(false)}
-                  className="px-4 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
-                >
-                  Đóng
-                </button>
-                <button
-                  type="submit"
-                  disabled={isAuthenticating}
-                  className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg cursor-pointer"
-                >
-                  {isAuthenticating
-                    ? 'Đang xác thực...'
-                    : isClaimed
-                      ? 'Mở Khóa & Đồng Bộ'
-                      : 'Tạo Mật Khẩu & Kích Hoạt'}
-                </button>
-              </div>
-            </form>
-          </div>
         </div>
       )}
 
