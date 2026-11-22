@@ -5,24 +5,6 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
-  onAuthStateChanged,
-  signInWithPopup,
-  signOut,
-  User,
-} from 'firebase/auth';
-import {
-  collection,
-  doc,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-  onSnapshot,
-  query,
-  where,
-  serverTimestamp,
-  Timestamp,
-} from 'firebase/firestore';
-import {
   Barcode,
   Plus,
   Trash2,
@@ -42,14 +24,12 @@ import {
   ChevronRight,
   Database,
   AlertTriangle,
+  KeyRound,
+  Save,
+  Copy,
+  RefreshCw,
+  Download,
 } from 'lucide-react';
-import {
-  auth,
-  db,
-  googleProvider,
-  OperationType,
-  handleFirestoreError,
-} from './firebase.ts';
 import {
   Product,
   BillLineItem,
@@ -92,10 +72,18 @@ function createEmptyOrderTab(tabNumber: number): PosOrderTab {
 }
 
 export default function App() {
-  // Authentication & Firestore State
-  const [user, setUser] = useState<User | null>(null);
+  // Vercel Blob Store (taphoadungcanh-blob) Authentication & Session State
+  // Security rule: Hold Bearer token strictly in memory (never in localStorage or sessionStorage)
+  const [sessionToken, setSessionToken] = useState<string | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
+  const [isClaimed, setIsClaimed] = useState(false);
+  const [blobConnected, setBlobConnected] = useState(false);
+  const [blobStoreId, setBlobStoreId] = useState('taphoadungcanh-blob');
+  const [passcodeInput, setPasscodeInput] = useState('');
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
+  const [showAuthModal, setShowAuthModal] = useState(false);
   const [authError, setAuthError] = useState<string>('');
+  const [blobSyncNotice, setBlobSyncNotice] = useState<string>('');
 
   // Navigation Section
   const [activeSection, setActiveSection] = useState<ActiveSection>('pos');
@@ -127,6 +115,7 @@ export default function App() {
   });
 
   const [previewQrInSettings, setPreviewQrInSettings] = useState<string>('');
+  const [isSavingProfile, setIsSavingProfile] = useState(false);
 
   useEffect(() => {
     try {
@@ -150,9 +139,11 @@ export default function App() {
     }
   }, [storeProfile]);
 
-  // Firestore Custom / Edited Products & Invoices
+  // Vercel Blob Store (taphoadungcanh-blob) Custom / Edited Products & Invoices
   const [dbProducts, setDbProducts] = useState<Product[]>([]);
-  const [deletedBarcodes, setDeletedBarcodes] = useState<Record<string, boolean>>(() => {
+  const [deletedBarcodes, setDeletedBarcodes] = useState<
+    Record<string, boolean>
+  >(() => {
     try {
       const saved = localStorage.getItem('dung_canh_deleted_barcodes');
       if (saved) return JSON.parse(saved);
@@ -169,8 +160,8 @@ export default function App() {
   /**
    * Merged Master Inventory:
    * Combines the 20,738+ Vietnamese grocery barcodes (`893...`) from VIETNAM_MASTER_PRODUCTS_LIST
-   * with user's custom or edited Firestore records (`dbProducts`), so all 20,738+ products
-   * are immediately available in Kho Hàng & POS while any price/stock edits persist to Firestore.
+   * with user's custom or edited Blob Store records (`dbProducts`), so all 20,738+ products
+   * are immediately available in Kho Hàng & POS while any price/stock edits persist to `taphoadungcanh-blob`.
    */
   const allProducts = useMemo<Product[]>(() => {
     const dbByBarcode = new Map<string, Product>();
@@ -187,7 +178,7 @@ export default function App() {
       }
     }
 
-    // 2. Add all 20,738+ Vietnamese grocery barcodes (using Firestore override if edited)
+    // 2. Add all 20,738+ Vietnamese grocery barcodes (using Blob Store override if edited)
     for (const entry of VIETNAM_MASTER_PRODUCTS_LIST) {
       if (deletedBarcodes[entry.barcode]) continue;
       const override = dbByBarcode.get(entry.barcode);
@@ -204,14 +195,14 @@ export default function App() {
           costPrice: entry.suggestedCostPrice,
           stock: entry.defaultStock,
           source: 'catalog_vn_9000',
-          ownerId: user?.uid || 'local',
+          ownerId: 'taphoadungcanh-blob',
           isCustomOrEdited: false,
         });
       }
     }
 
     return merged;
-  }, [dbProducts, deletedBarcodes, user?.uid]);
+  }, [dbProducts, deletedBarcodes]);
 
   // Multi-Tab POS Orders (Làm nhiều phiếu cùng một lúc)
   const [orderTabs, setOrderTabs] = useState<PosOrderTab[]>(() => {
@@ -255,6 +246,7 @@ export default function App() {
   const [posFeedback, setPosFeedback] = useState<string>('');
   const [isSavingInvoice, setIsSavingInvoice] = useState(false);
   const [isBatchSyncing, setIsBatchSyncing] = useState(false);
+  const [isBackupWorking, setIsBackupWorking] = useState(false);
 
   // Quick Manual Line Item Addition on Bill
   const [customItemName, setCustomItemName] = useState('');
@@ -285,125 +277,228 @@ export default function App() {
 
   const scannerInputRef = useRef<HTMLInputElement>(null);
 
-  // 1. Firebase Auth Listener
+  // 1. Check Blob Store & Admin Credential Status on Mount
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setIsAuthReady(true);
-    });
-    return () => unsubscribe();
+    let mounted = true;
+    fetch('/api/auth/status')
+      .then((res) => res.json())
+      .then((data) => {
+        if (!mounted) return;
+        setIsClaimed(Boolean(data?.isClaimed));
+        setBlobConnected(Boolean(data?.blobConnected));
+        if (data?.blobStoreId) {
+          setBlobStoreId(String(data.blobStoreId));
+        }
+        setIsAuthReady(true);
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setIsAuthReady(true);
+      });
+    return () => {
+      mounted = false;
+    };
   }, []);
 
-  // 2. Real-time Firestore Listeners for Products & Invoices
-  useEffect(() => {
-    if (!isAuthReady || !user) {
-      setDbProducts([]);
-      setInvoices([]);
-      return;
-    }
-
-    const productsQuery = query(
-      collection(db, 'products'),
-      where('ownerId', '==', user.uid)
-    );
-
-    const unsubProducts = onSnapshot(
-      productsQuery,
-      (snapshot) => {
-        const list: Product[] = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data();
-          return {
-            id: docSnap.id,
-            barcode: String(data.barcode || ''),
-            name: String(data.name || ''),
-            category: String(data.category || 'Hàng tạp hóa khác'),
-            unit: String(data.unit || 'Cái'),
-            price: Number(data.price) || 0,
-            costPrice: Number(data.costPrice) || 0,
-            stock: Number(data.stock) || 0,
-            source: String(data.source || 'manual'),
-            ownerId: String(data.ownerId || user.uid),
-            isCustomOrEdited: true,
-            createdAt: data.createdAt,
-            updatedAt: data.updatedAt,
-          };
-        });
-        setDbProducts(list);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'products');
-      }
-    );
-
-    const invoicesQuery = query(
-      collection(db, 'invoices'),
-      where('ownerId', '==', user.uid)
-    );
-
-    const unsubInvoices = onSnapshot(
-      invoicesQuery,
-      (snapshot) => {
-        const list: InvoiceRecord[] = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data();
-          let parsedItems: BillLineItem[] = [];
-          try {
-            parsedItems = JSON.parse(String(data.itemsJson || '[]'));
-          } catch {
-            parsedItems = [];
-          }
-          const createdTs = data.createdAt as Timestamp | undefined;
-          return {
-            id: docSnap.id,
-            invoiceCode: String(data.invoiceCode || docSnap.id),
-            tabName: String(data.tabName || 'Phiếu 1'),
-            customerName: String(data.customerName || 'Khách lẻ'),
-            itemsJson: String(data.itemsJson || '[]'),
-            items: parsedItems,
-            itemCount: Number(data.itemCount) || 0,
-            subtotal: Number(data.subtotal) || 0,
-            discount: Number(data.discount) || 0,
-            totalAmount: Number(data.totalAmount) || 0,
-            amountTendered: Number(data.amountTendered) || 0,
-            changeDue: Number(data.changeDue) || 0,
-            paperWidth: data.paperWidth === '58mm' ? '58mm' : '80mm',
-            ownerId: String(data.ownerId || user.uid),
-            createdAt: data.createdAt,
-            createdAtDate: createdTs?.toDate ? createdTs.toDate() : new Date(),
-          };
-        });
-        list.sort(
-          (a, b) =>
-            (b.createdAtDate?.getTime() || 0) - (a.createdAtDate?.getTime() || 0)
-        );
-        setInvoices(list);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'invoices');
-      }
-    );
-
-    return () => {
-      unsubProducts();
-      unsubInvoices();
-    };
-  }, [isAuthReady, user]);
-
-  // Sign In with Google Popup
-  const handleGoogleSignIn = async () => {
-    setAuthError('');
+  // 2. Fetch Database State from Vercel Blob Store (taphoadungcanh-blob) when authenticated
+  const fetchBlobDatabaseState = async (
+    tokenToUse: string,
+    forceRefresh = false
+  ) => {
     try {
-      await signInWithPopup(auth, googleProvider);
+      const res = await fetch(
+        `/api/db/state${forceRefresh ? '?refresh=1' : ''}`,
+        {
+          headers: {
+            Authorization: `Bearer ${tokenToUse}`,
+          },
+        }
+      );
+      if (res.status === 401) {
+        setSessionToken(null);
+        return;
+      }
+      if (!res.ok) return;
+      const data = await res.json();
+      setBlobConnected(Boolean(data?.blobConnected));
+
+      if (data?.storeProfile) {
+        setStoreProfile((prev) => ({
+          ...prev,
+          ...data.storeProfile,
+        }));
+      }
+
+      if (data?.deletedBarcodes && typeof data.deletedBarcodes === 'object') {
+        setDeletedBarcodes(data.deletedBarcodes);
+      }
+
+      if (Array.isArray(data?.products)) {
+        const mappedProducts: Product[] = data.products.map(
+          (p: Record<string, unknown>) => ({
+            id: String(p.id || `blob_prod_${p.barcode}`),
+            barcode: String(p.barcode || ''),
+            name: String(p.name || ''),
+            category: String(p.category || 'Hàng tạp hóa khác'),
+            unit: String(p.unit || 'Cái'),
+            price: Number(p.price) || 0,
+            costPrice: Number(p.costPrice) || 0,
+            stock: Number(p.stock) || 0,
+            source: String(p.source || 'taphoadungcanh-blob'),
+            ownerId: 'taphoadungcanh-blob',
+            isCustomOrEdited: true,
+          })
+        );
+        setDbProducts(mappedProducts);
+      }
+
+      if (Array.isArray(data?.invoices)) {
+        const mappedInvoices: InvoiceRecord[] = data.invoices.map(
+          (inv: Record<string, unknown>) => {
+            let parsedItems: BillLineItem[] = [];
+            try {
+              parsedItems = JSON.parse(String(inv.itemsJson || '[]'));
+            } catch {
+              parsedItems = [];
+            }
+            const createdIso = String(
+              inv.createdAtIso || new Date().toISOString()
+            );
+            return {
+              id: String(inv.id || inv.invoiceCode),
+              invoiceCode: String(inv.invoiceCode || inv.id),
+              tabName: String(inv.tabName || 'Phiếu 1'),
+              customerName: String(inv.customerName || 'Khách lẻ'),
+              itemsJson: String(inv.itemsJson || '[]'),
+              items: parsedItems,
+              itemCount: Number(inv.itemCount) || 0,
+              subtotal: Number(inv.subtotal) || 0,
+              discount: Number(inv.discount) || 0,
+              totalAmount: Number(inv.totalAmount) || 0,
+              amountTendered: Number(inv.amountTendered) || 0,
+              changeDue: Number(inv.changeDue) || 0,
+              paperWidth: inv.paperWidth === '58mm' ? '58mm' : '80mm',
+              ownerId: 'taphoadungcanh-blob',
+              createdAtDate: new Date(createdIso),
+            };
+          }
+        );
+        setInvoices(mappedInvoices);
+      }
     } catch (error) {
       setAuthError(
         error instanceof Error
           ? error.message
-          : 'Không thể đăng nhập bằng Google.'
+          : 'Không thể đồng bộ dữ liệu từ taphoadungcanh-blob.'
       );
     }
   };
 
-  const handleSignOut = async () => {
-    await signOut(auth);
+  useEffect(() => {
+    if (sessionToken) {
+      fetchBlobDatabaseState(sessionToken, true);
+    }
+  }, [sessionToken]);
+
+  // Claim or Sign In to Vercel Blob Store (taphoadungcanh-blob)
+  const handleClaimOrLoginBlobStore = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const cleanPass = passcodeInput.trim();
+    if (cleanPass.length < 4) {
+      setAuthError('Vui lòng nhập mật khẩu quản lý cửa hàng (từ 4 ký tự).');
+      return;
+    }
+
+    setAuthError('');
+    setIsAuthenticating(true);
+    try {
+      const endpoint = isClaimed ? '/api/auth/login' : '/api/auth/claim';
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passcode: cleanPass }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(
+          data?.error || 'Không thể mở khóa kho dữ liệu taphoadungcanh-blob.'
+        );
+        return;
+      }
+
+      if (data?.token) {
+        setSessionToken(String(data.token));
+        setIsClaimed(true);
+        setPasscodeInput('');
+        setShowAuthModal(false);
+        setBlobSyncNotice(
+          'Đã kết nối & mở khóa cơ sở dữ liệu taphoadungcanh-blob thành công!'
+        );
+      }
+    } catch (error) {
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Lỗi kết nối đến máy chủ Blob Store.'
+      );
+    } finally {
+      setIsAuthenticating(false);
+    }
+  };
+
+  const handleSignOut = () => {
+    setSessionToken(null);
+    setBlobSyncNotice('Đã khóa phiên kết nối cơ sở dữ liệu taphoadungcanh-blob.');
+  };
+
+  // Save Store Profile & Bank QR Configuration to Vercel Blob Store
+  const handleSaveProfileToBlobStore = async (
+    nextProfile?: StoreProfile,
+    silent = false
+  ) => {
+    const profileToSave = nextProfile || storeProfile;
+    if (!sessionToken) {
+      if (!silent) {
+        setShowAuthModal(true);
+        setAuthError(
+          'Vui lòng mở khóa mật khẩu cửa hàng để lưu cấu hình Mã QR & Cửa hàng lên taphoadungcanh-blob.'
+        );
+      }
+      return;
+    }
+
+    setIsSavingProfile(true);
+    try {
+      const res = await fetch('/api/db/profile', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify(profileToSave),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(
+          errData?.error || 'Không thể lưu cấu hình lên taphoadungcanh-blob.'
+        );
+      }
+      if (!silent) {
+        setBlobSyncNotice(
+          'Đã lưu cấu hình Mã QR Ngân hàng & Cửa hàng lên taphoadungcanh-blob!'
+        );
+      }
+    } catch (error) {
+      if (!silent) {
+        setAuthError(
+          error instanceof Error
+            ? error.message
+            : 'Lỗi lưu cấu hình lên taphoadungcanh-blob.'
+        );
+      }
+    } finally {
+      setIsSavingProfile(false);
+    }
   };
 
   // Multi-Tab POS Helpers
@@ -422,6 +517,500 @@ export default function App() {
     setOrderTabs((prev) => [...prev, nextTab]);
     setActiveTabId(nextTab.id);
     setCurrentInvoiceCode(generateInvoiceCode());
+  };
+
+  // Duplicate active order tab ("Lưu bản sao phiếu hiện tại")
+  const handleDuplicateActiveOrderTab = () => {
+    const maxNum = orderTabs.reduce(
+      (max, t) => Math.max(max, t.tabNumber || 1),
+      0
+    );
+    const nextNum = maxNum + 1;
+    const duplicatedItems: BillLineItem[] = activeOrderTab.items.map((item) => ({
+      ...item,
+      lineId: `line_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    }));
+
+    const copyTab: PosOrderTab = {
+      id: `tab_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      tabNumber: nextNum,
+      label: `Phiếu ${nextNum} (Bản sao)`,
+      customerName: activeOrderTab.customerName,
+      createdAtIso: new Date().toISOString(),
+      items: duplicatedItems,
+      discount: activeOrderTab.discount,
+      amountTendered: activeOrderTab.amountTendered,
+    };
+
+    setOrderTabs((prev) => [...prev, copyTab]);
+    setActiveTabId(copyTab.id);
+    setCurrentInvoiceCode(generateInvoiceCode());
+    setPosFeedback(
+      `Đã lưu bản sao từ ${activeOrderTab.label} sang ${copyTab.label}!`
+    );
+  };
+
+  // Save a new copy of an invoice to Lịch sử bill ("Lưu bản sao hóa đơn")
+  const handleSaveCopyOfBillToHistory = async (sourceInvoice?: InvoiceRecord) => {
+    const itemsToCopy = sourceInvoice
+      ? sourceInvoice.items
+      : activeOrderTab.items;
+    if (itemsToCopy.length === 0) {
+      setPosFeedback('Phiếu chưa có mặt hàng nào để lưu bản sao.');
+      return;
+    }
+
+    const subtotal = itemsToCopy.reduce(
+      (sum, item) => sum + item.price * item.quantity,
+      0
+    );
+    const itemCount = itemsToCopy.reduce((sum, item) => sum + item.quantity, 0);
+    const discount = Math.max(
+      0,
+      Math.round(
+        sourceInvoice ? sourceInvoice.discount : activeOrderTab.discount || 0
+      )
+    );
+    const totalAmount = Math.max(0, subtotal - discount);
+    const rawTendered = sourceInvoice
+      ? sourceInvoice.amountTendered
+      : activeOrderTab.amountTendered;
+    const amountTendered =
+      rawTendered > 0 ? Math.round(rawTendered) : totalAmount;
+    const changeDue = Math.max(0, amountTendered - totalAmount);
+    const copyCode = `${generateInvoiceCode()}-BS`;
+
+    const serializedItems = JSON.stringify(
+      itemsToCopy.map((i) => ({
+        lineId: i.lineId,
+        barcode: i.barcode,
+        name: i.name.trim() || 'Hàng tạp hóa',
+        unit: i.unit,
+        price: i.price,
+        quantity: i.quantity,
+      }))
+    ).slice(0, 8000);
+
+    setIsSavingInvoice(true);
+    try {
+      if (sessionToken) {
+        const res = await fetch('/api/db/invoices', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
+          },
+          body: JSON.stringify({
+            invoiceCode: copyCode.slice(0, 64),
+            tabName: `${
+              sourceInvoice ? sourceInvoice.tabName : activeOrderTab.label
+            } (Bản sao)`.slice(0, 100),
+            customerName: (
+              (sourceInvoice
+                ? sourceInvoice.customerName
+                : activeOrderTab.customerName
+              ).trim() || 'Khách lẻ'
+            ).slice(0, 150),
+            itemsJson: serializedItems,
+            itemCount,
+            subtotal,
+            discount,
+            totalAmount,
+            amountTendered,
+            changeDue,
+            paperWidth: storeProfile.paperWidth,
+          }),
+        });
+        const data = await res.json();
+        if (res.ok && data?.invoice) {
+          if (!sourceInvoice) {
+            updateActiveTab((t) => ({
+              ...t,
+              savedInvoiceId: data.invoice.id,
+              savedInvoiceCode: data.invoice.invoiceCode,
+            }));
+          }
+          await fetchBlobDatabaseState(sessionToken, true);
+        }
+      } else {
+        const newLocalId = `inv_copy_${Date.now()}`;
+        const localCopy: InvoiceRecord = {
+          id: newLocalId,
+          invoiceCode: copyCode,
+          tabName: `${
+            sourceInvoice ? sourceInvoice.tabName : activeOrderTab.label
+          } (Bản sao)`,
+          customerName:
+            (sourceInvoice
+              ? sourceInvoice.customerName
+              : activeOrderTab.customerName
+            ).trim() || 'Khách lẻ',
+          itemsJson: serializedItems,
+          items: [...itemsToCopy],
+          itemCount,
+          subtotal,
+          discount,
+          totalAmount,
+          amountTendered,
+          changeDue,
+          paperWidth: storeProfile.paperWidth,
+          ownerId: 'taphoadungcanh-blob',
+          createdAtDate: new Date(),
+        };
+        setInvoices((prev) => [localCopy, ...prev]);
+        if (!sourceInvoice) {
+          updateActiveTab((t) => ({
+            ...t,
+            savedInvoiceId: newLocalId,
+            savedInvoiceCode: copyCode,
+          }));
+        }
+      }
+
+      setBlobSyncNotice(`Đã lưu bản sao hóa đơn ${copyCode} thành công!`);
+      setPosFeedback(`Đã lưu bản sao hóa đơn (${copyCode}) vào Lịch Sử Bill!`);
+    } catch (error) {
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Không thể lưu bản sao hóa đơn.'
+      );
+    } finally {
+      setIsSavingInvoice(false);
+    }
+  };
+
+  // Update an existing saved invoice in Lịch sử bill ("Cập nhật bản lưu")
+  const handleUpdateSavedBillInHistory = async () => {
+    if (activeOrderTab.items.length === 0) {
+      setPosFeedback('Phiếu chưa có mặt hàng nào để cập nhật bản lưu.');
+      return;
+    }
+
+    const targetSavedId =
+      activeOrderTab.savedInvoiceId ||
+      selectedHistoryInvoice?.id ||
+      invoices[0]?.id;
+
+    if (!targetSavedId) {
+      // If no previous saved record exists yet, save it as the first saved record
+      await handleSaveCopyOfBillToHistory();
+      return;
+    }
+
+    const subtotal = activeOrderTab.items.reduce(
+      (sum, item) => sum + item.price * item.quantity,
+      0
+    );
+    const itemCount = activeOrderTab.items.reduce(
+      (sum, item) => sum + item.quantity,
+      0
+    );
+    const discount = Math.max(0, Math.round(activeOrderTab.discount || 0));
+    const totalAmount = Math.max(0, subtotal - discount);
+    const amountTendered =
+      activeOrderTab.amountTendered > 0
+        ? Math.round(activeOrderTab.amountTendered)
+        : totalAmount;
+    const changeDue = Math.max(0, amountTendered - totalAmount);
+    const codeToKeep =
+      activeOrderTab.savedInvoiceCode || currentInvoiceCode;
+
+    const serializedItems = JSON.stringify(
+      activeOrderTab.items.map((i) => ({
+        lineId: i.lineId,
+        barcode: i.barcode,
+        name: i.name.trim() || 'Hàng tạp hóa',
+        unit: i.unit,
+        price: i.price,
+        quantity: i.quantity,
+      }))
+    ).slice(0, 8000);
+
+    setIsSavingInvoice(true);
+    try {
+      if (sessionToken) {
+        const res = await fetch(
+          `/api/db/invoices/${encodeURIComponent(targetSavedId)}`,
+          {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${sessionToken}`,
+            },
+            body: JSON.stringify({
+              invoiceCode: codeToKeep,
+              tabName: activeOrderTab.label,
+              customerName:
+                activeOrderTab.customerName.trim() || 'Khách lẻ',
+              itemsJson: serializedItems,
+              itemCount,
+              subtotal,
+              discount,
+              totalAmount,
+              amountTendered,
+              changeDue,
+              paperWidth: storeProfile.paperWidth,
+            }),
+          }
+        );
+
+        if (res.ok) {
+          await fetchBlobDatabaseState(sessionToken, true);
+        } else {
+          // If the record ID was not found on server, save as a new copy
+          await handleSaveCopyOfBillToHistory();
+          return;
+        }
+      } else {
+        setInvoices((prev) =>
+          prev.map((inv) =>
+            inv.id === targetSavedId
+              ? {
+                  ...inv,
+                  invoiceCode: codeToKeep,
+                  tabName: activeOrderTab.label,
+                  customerName:
+                    activeOrderTab.customerName.trim() || 'Khách lẻ',
+                  itemsJson: serializedItems,
+                  items: [...activeOrderTab.items],
+                  itemCount,
+                  subtotal,
+                  discount,
+                  totalAmount,
+                  amountTendered,
+                  changeDue,
+                  paperWidth: storeProfile.paperWidth,
+                }
+              : inv
+          )
+        );
+      }
+
+      updateActiveTab((t) => ({
+        ...t,
+        savedInvoiceId: targetSavedId,
+        savedInvoiceCode: codeToKeep,
+      }));
+      setBlobSyncNotice(
+        `Đã cập nhật bản lưu hóa đơn ${codeToKeep} trên taphoadungcanh-blob!`
+      );
+      setPosFeedback(
+        `Đã cập nhật bản lưu hóa đơn (${codeToKeep}) thành công!`
+      );
+    } catch (error) {
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Lỗi khi cập nhật bản lưu hóa đơn.'
+      );
+    } finally {
+      setIsSavingInvoice(false);
+    }
+  };
+
+  // Load a saved invoice from history into a POS tab so the user can edit and click "Cập nhật bản lưu" or "Lưu bản sao"
+  const handleLoadInvoiceToPosForUpdate = (inv: InvoiceRecord) => {
+    const maxNum = orderTabs.reduce(
+      (max, t) => Math.max(max, t.tabNumber || 1),
+      0
+    );
+    const nextNum = maxNum + 1;
+    const loadedTab: PosOrderTab = {
+      id: `tab_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      tabNumber: nextNum,
+      label: `Sửa ${inv.invoiceCode}`,
+      customerName: inv.customerName,
+      createdAtIso: new Date().toISOString(),
+      items: inv.items.map((item) => ({
+        ...item,
+        lineId:
+          item.lineId ||
+          `line_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      })),
+      discount: inv.discount,
+      amountTendered: inv.amountTendered,
+      savedInvoiceId: inv.id,
+      savedInvoiceCode: inv.invoiceCode,
+    };
+
+    setOrderTabs((prev) => [...prev, loadedTab]);
+    setActiveTabId(loadedTab.id);
+    setCurrentInvoiceCode(inv.invoiceCode);
+    setActiveSection('pos');
+    setPosFeedback(
+      `Đang mở bản lưu ${inv.invoiceCode}: Bạn có thể sửa hàng hóa rồi bấm "Cập nhật bản lưu" hoặc "Lưu bản sao".`
+    );
+  };
+
+  // Full Database Backup Copy ("Lưu bản sao CSDL") & Update/Restore Database ("Cập nhật bản lưu CSDL")
+  const handleCreateDatabaseBackupCopy = async () => {
+    setIsBackupWorking(true);
+    try {
+      let snapshotToDownload: Record<string, unknown> = {
+        version: 1,
+        storeId: blobStoreId,
+        updatedAtIso: new Date().toISOString(),
+        storeProfile,
+        products: dbProducts,
+        deletedBarcodes,
+        invoices,
+      };
+
+      if (sessionToken) {
+        const res = await fetch('/api/db/backup-copy', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
+          },
+          body: JSON.stringify({ label: 'manual' }),
+        });
+        const data = await res.json();
+        if (res.ok && data?.backupSnapshot) {
+          snapshotToDownload = data.backupSnapshot;
+          setBlobSyncNotice(
+            `Đã tạo bản sao lưu trên taphoadungcanh-blob (${data.copyPathname}) và tải bản sao về máy!`
+          );
+        }
+      } else {
+        setBlobSyncNotice('Đã tải tệp bản sao dữ liệu (.json) về máy!');
+      }
+
+      // Trigger JSON backup download to user's computer
+      const blob = new Blob([JSON.stringify(snapshotToDownload, null, 2)], {
+        type: 'application/json',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const dateStr = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `taphoadungcanh-bansao-${dateStr}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Lỗi khi tạo bản sao cơ sở dữ liệu.'
+      );
+    } finally {
+      setIsBackupWorking(false);
+    }
+  };
+
+  const handleUpdateSavedDatabaseOnBlob = async () => {
+    if (!sessionToken) {
+      setShowAuthModal(true);
+      setAuthError(
+        'Vui lòng mở khóa mật khẩu cửa hàng để cập nhật bản lưu lên taphoadungcanh-blob.'
+      );
+      return;
+    }
+
+    setIsBackupWorking(true);
+    try {
+      const res = await fetch('/api/db/restore-or-update', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          snapshot: {
+            storeProfile,
+            products: dbProducts,
+            deletedBarcodes,
+            invoices: invoices.map((inv) => ({
+              id: inv.id,
+              invoiceCode: inv.invoiceCode,
+              tabName: inv.tabName,
+              customerName: inv.customerName,
+              itemsJson: inv.itemsJson,
+              itemCount: inv.itemCount,
+              subtotal: inv.subtotal,
+              discount: inv.discount,
+              totalAmount: inv.totalAmount,
+              amountTendered: inv.amountTendered,
+              changeDue: inv.changeDue,
+              paperWidth: inv.paperWidth,
+              createdAtIso: inv.createdAtDate
+                ? inv.createdAtDate.toISOString()
+                : new Date().toISOString(),
+            })),
+          },
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(
+          data?.error || 'Không thể cập nhật bản lưu lên taphoadungcanh-blob.'
+        );
+      }
+      await fetchBlobDatabaseState(sessionToken, true);
+      setBlobSyncNotice(
+        `Đã cập nhật bản lưu CSDL trên taphoadungcanh-blob (${data.productCount} sản phẩm tùy chỉnh · ${data.invoiceCount} hóa đơn)!`
+      );
+    } catch (error) {
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Lỗi khi cập nhật bản lưu cơ sở dữ liệu.'
+      );
+    } finally {
+      setIsBackupWorking(false);
+    }
+  };
+
+  const handleImportBackupCopyFile = (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const parsed = JSON.parse(String(reader.result || '{}'));
+        if (!sessionToken) {
+          if (parsed.storeProfile) {
+            setStoreProfile((prev) => ({ ...prev, ...parsed.storeProfile }));
+          }
+          setBlobSyncNotice(
+            'Đã nạp bản sao dữ liệu vào phiên làm việc. Mở khóa Blob Store để cập nhật bản lưu lên Cloud.'
+          );
+          return;
+        }
+        setIsBackupWorking(true);
+        const res = await fetch('/api/db/restore-or-update', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
+          },
+          body: JSON.stringify({ snapshot: parsed }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data?.error || 'Tệp bản sao không hợp lệ.');
+        }
+        await fetchBlobDatabaseState(sessionToken, true);
+        setBlobSyncNotice(
+          `Đã khôi phục & cập nhật bản lưu từ tệp bản sao lên taphoadungcanh-blob (${data.invoiceCount} hóa đơn)!`
+        );
+      } catch (err) {
+        setAuthError(
+          err instanceof Error
+            ? err.message
+            : 'Không thể đọc tệp bản sao JSON.'
+        );
+      } finally {
+        setIsBackupWorking(false);
+        e.target.value = '';
+      }
+    };
+    reader.readAsText(file);
   };
 
   const handleCloseOrderTab = (tabId: string) => {
@@ -497,7 +1086,7 @@ export default function App() {
 
     setPosScannerInput('');
 
-    // 1. Check in allProducts (which includes Firestore + 20,738+ Vietnamese barcodes)
+    // 1. Check in allProducts (which includes taphoadungcanh-blob + 20,738+ Vietnamese barcodes)
     const matched = allProducts.find(
       (p) => p.barcode.toLowerCase() === cleanCode.toLowerCase()
     );
@@ -516,8 +1105,8 @@ export default function App() {
     setAutoModalBarcode(cleanCode);
   };
 
-  // Save or Update Product in Firestore (adhering strictly to firestore.rules)
-  const handleSaveProductToFirestore = async (
+  // Save or Update Product in Vercel Blob Store (taphoadungcanh-blob)
+  const handleSaveProductToBlobStore = async (
     productData: {
       barcode: string;
       name: string;
@@ -548,60 +1137,61 @@ export default function App() {
       );
     }
 
-    if (!user) {
+    // Update local in-memory state immediately so UI reflects the price/stock right away
+    const updatedProduct: Product = {
+      id: `blob_prod_${cleanBarcode}`,
+      barcode: cleanBarcode,
+      name: productData.name.trim().slice(0, 200),
+      category: productData.category.trim().slice(0, 100),
+      unit: productData.unit.trim().slice(0, 50),
+      price: Math.max(0, Math.round(productData.price)),
+      costPrice: Math.max(0, Math.round(productData.costPrice)),
+      stock: Math.max(0, Math.round(productData.stock)),
+      source: productData.source.trim().slice(0, 50),
+      ownerId: 'taphoadungcanh-blob',
+      isCustomOrEdited: true,
+    };
+
+    setDbProducts((prev) => {
+      const filtered = prev.filter((p) => p.barcode !== cleanBarcode);
+      return [updatedProduct, ...filtered];
+    });
+
+    if (autoModalBarcode) {
+      setAutoModalBarcode(null);
+    }
+
+    if (!sessionToken) {
+      setShowAuthModal(true);
       setAuthError(
-        'Vui lòng đăng nhập Google để lưu thay đổi giá & tồn kho vào cơ sở dữ liệu.'
+        'Vui lòng mở khóa mật khẩu cửa hàng để lưu vĩnh viễn sản phẩm vào taphoadungcanh-blob.'
       );
-      if (autoModalBarcode) setAutoModalBarcode(null);
       return;
     }
 
-    const existingInDb = dbProducts.find((p) => p.barcode === cleanBarcode);
-    const docId = existingInDb
-      ? existingInDb.id
-      : `prod_${cleanBarcode}_${user.uid.slice(0, 8)}`.replace(
-          /[^a-zA-Z0-9_-]/g,
-          '_'
-        );
-
-    const path = `products/${docId}`;
     try {
-      if (existingInDb) {
-        await updateDoc(doc(db, 'products', docId), {
-          barcode: cleanBarcode,
-          name: productData.name.trim().slice(0, 200),
-          category: productData.category.trim().slice(0, 100),
-          unit: productData.unit.trim().slice(0, 50),
-          price: Math.max(0, Math.round(productData.price)),
-          costPrice: Math.max(0, Math.round(productData.costPrice)),
-          stock: Math.max(0, Math.round(productData.stock)),
-          source: productData.source.trim().slice(0, 50),
-          updatedAt: serverTimestamp(),
-        });
-      } else {
-        await setDoc(doc(db, 'products', docId), {
-          barcode: cleanBarcode,
-          name: productData.name.trim().slice(0, 200),
-          category: productData.category.trim().slice(0, 100),
-          unit: productData.unit.trim().slice(0, 50),
-          price: Math.max(0, Math.round(productData.price)),
-          costPrice: Math.max(0, Math.round(productData.costPrice)),
-          stock: Math.max(0, Math.round(productData.stock)),
-          source: productData.source.trim().slice(0, 50),
-          ownerId: user.uid,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+      const res = await fetch('/api/db/products', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify(updatedProduct),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(
+          errData?.error || 'Lỗi lưu sản phẩm vào taphoadungcanh-blob.'
+        );
       }
-
-      if (autoModalBarcode) {
-        setAutoModalBarcode(null);
-      }
+      setBlobSyncNotice(
+        `Đã lưu sản phẩm ${updatedProduct.name} (${cleanBarcode}) vào taphoadungcanh-blob!`
+      );
     } catch (error) {
-      handleFirestoreError(
-        error,
-        existingInDb ? OperationType.UPDATE : OperationType.CREATE,
-        path
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Không thể lưu sản phẩm vào taphoadungcanh-blob.'
       );
     }
   };
@@ -653,7 +1243,7 @@ export default function App() {
     });
   };
 
-  // Print Thermal Receipt & Save Invoice + Deduct Inventory Stock in Firestore
+  // Print Thermal Receipt & Save Invoice + Deduct Inventory Stock in Vercel Blob Store (taphoadungcanh-blob)
   const handlePrintAndSaveInvoice = async () => {
     if (activeOrderTab.items.length === 0) return;
 
@@ -675,30 +1265,53 @@ export default function App() {
 
     setIsSavingInvoice(true);
     try {
-      if (user) {
-        const invId = `inv_${Date.now()}_${user.uid.slice(0, 6)}`.replace(
-          /[^a-zA-Z0-9_-]/g,
-          '_'
-        );
-        const serializedItems = JSON.stringify(
-          activeOrderTab.items.map((i) => ({
-            lineId: i.lineId,
-            barcode: i.barcode,
-            name: i.name.trim() || 'Hàng tạp hóa',
-            unit: i.unit,
-            price: i.price,
-            quantity: i.quantity,
-          }))
-        ).slice(0, 4000);
+      const serializedItems = JSON.stringify(
+        activeOrderTab.items.map((i) => ({
+          lineId: i.lineId,
+          barcode: i.barcode,
+          name: i.name.trim() || 'Hàng tạp hóa',
+          unit: i.unit,
+          price: i.price,
+          quantity: i.quantity,
+        }))
+      ).slice(0, 8000);
 
-        await setDoc(doc(db, 'invoices', invId), {
-          invoiceCode: currentInvoiceCode.slice(0, 64),
-          tabName: activeOrderTab.label.slice(0, 100),
-          customerName: (activeOrderTab.customerName.trim() || 'Khách lẻ').slice(
-            0,
-            150
-          ),
+      if (sessionToken) {
+        const res = await fetch('/api/db/invoices', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
+          },
+          body: JSON.stringify({
+            invoiceCode: currentInvoiceCode.slice(0, 64),
+            tabName: activeOrderTab.label.slice(0, 100),
+            customerName: (
+              activeOrderTab.customerName.trim() || 'Khách lẻ'
+            ).slice(0, 150),
+            itemsJson: serializedItems,
+            itemCount,
+            subtotal,
+            discount,
+            totalAmount,
+            amountTendered,
+            changeDue,
+            paperWidth: storeProfile.paperWidth,
+          }),
+        });
+
+        if (res.ok) {
+          await fetchBlobDatabaseState(sessionToken, true);
+        }
+      } else {
+        // Also record in local session state if not unlocked yet
+        const localInvoice: InvoiceRecord = {
+          id: `inv_${Date.now()}`,
+          invoiceCode: currentInvoiceCode,
+          tabName: activeOrderTab.label,
+          customerName: activeOrderTab.customerName.trim() || 'Khách lẻ',
           itemsJson: serializedItems,
+          items: [...activeOrderTab.items],
           itemCount,
           subtotal,
           discount,
@@ -706,23 +1319,10 @@ export default function App() {
           amountTendered,
           changeDue,
           paperWidth: storeProfile.paperWidth,
-          ownerId: user.uid,
-          createdAt: serverTimestamp(),
-        });
-
-        // Deduct inventory stock in Firestore for items already synced in dbProducts
-        for (const line of activeOrderTab.items) {
-          const matchedInDb = dbProducts.find(
-            (p) => p.barcode === line.barcode
-          );
-          if (matchedInDb) {
-            const nextStock = Math.max(0, matchedInDb.stock - line.quantity);
-            await updateDoc(doc(db, 'products', matchedInDb.id), {
-              stock: nextStock,
-              updatedAt: serverTimestamp(),
-            });
-          }
-        }
+          ownerId: 'taphoadungcanh-blob',
+          createdAtDate: new Date(),
+        };
+        setInvoices((prev) => [localInvoice, ...prev]);
       }
 
       // Trigger browser thermal print dialog
@@ -738,10 +1338,14 @@ export default function App() {
       }));
       setCurrentInvoiceCode(generateInvoiceCode());
       setPosFeedback(
-        `Đã lưu & phát lệnh in hóa đơn ${currentInvoiceCode} thành công!`
+        `Đã lưu vào taphoadungcanh-blob & phát lệnh in hóa đơn ${currentInvoiceCode} thành công!`
       );
     } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, 'invoices');
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Không thể lưu hóa đơn vào taphoadungcanh-blob.'
+      );
     } finally {
       setIsSavingInvoice(false);
     }
@@ -794,38 +1398,52 @@ export default function App() {
     return filteredInventoryProducts.slice(start, start + INVENTORY_PAGE_SIZE);
   }, [filteredInventoryProducts, inventoryPage]);
 
-  // Batch sync current page of products to Firestore
-  const handleBatchSyncVisiblePageToFirestore = async () => {
-    if (!user) {
-      setAuthError('Vui lòng đăng nhập Google để đồng bộ lên Cloud CSDL.');
+  // Batch sync current page of products to Vercel Blob Store (taphoadungcanh-blob)
+  const handleBatchSyncVisiblePageToBlobStore = async () => {
+    if (!sessionToken) {
+      setShowAuthModal(true);
+      setAuthError(
+        'Vui lòng mở khóa mật khẩu cửa hàng để đồng bộ lên taphoadungcanh-blob.'
+      );
       return;
     }
     setIsBatchSyncing(true);
     try {
-      for (const item of visibleInventoryPageItems) {
-        const alreadyInDb = dbProducts.some((p) => p.barcode === item.barcode);
-        if (!alreadyInDb) {
-          const docId = `prod_${item.barcode}_${user.uid.slice(0, 8)}`.replace(
-            /[^a-zA-Z0-9_-]/g,
-            '_'
-          );
-          await setDoc(doc(db, 'products', docId), {
+      const res = await fetch('/api/db/products/batch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          products: visibleInventoryPageItems.map((item) => ({
             barcode: item.barcode,
-            name: item.name.slice(0, 200),
-            category: item.category.slice(0, 100),
-            unit: item.unit.slice(0, 50),
+            name: item.name,
+            category: item.category,
+            unit: item.unit,
             price: item.price,
             costPrice: item.costPrice,
             stock: item.stock,
             source: 'catalog_vn_9000',
-            ownerId: user.uid,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        }
+          })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(
+          data?.error || 'Lỗi đồng bộ danh sách lên taphoadungcanh-blob.'
+        );
       }
+      await fetchBlobDatabaseState(sessionToken, true);
+      setBlobSyncNotice(
+        `Đã đồng bộ ${data.syncedCount || visibleInventoryPageItems.length} mã hàng trên trang này lên taphoadungcanh-blob!`
+      );
     } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, 'products');
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Không thể đồng bộ lên taphoadungcanh-blob.'
+      );
     } finally {
       setIsBatchSyncing(false);
     }
@@ -838,10 +1456,14 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') {
-        setStoreProfile((prev) => ({
-          ...prev,
+        const nextProfile = {
+          ...storeProfile,
           customQrDataUrl: reader.result as string,
-        }));
+        };
+        setStoreProfile(nextProfile);
+        if (sessionToken) {
+          handleSaveProfileToBlobStore(nextProfile, true);
+        }
       }
     };
     reader.readAsDataURL(file);
@@ -934,41 +1556,86 @@ export default function App() {
 
         {/* Zone 3: 1 primary action */}
         <div className="flex items-center shrink-0">
-          {user ? (
+          {sessionToken ? (
             <button
               type="button"
               onClick={handleSignOut}
               className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-              title={`Đăng nhập: ${user.email || ''}`}
+              title={`Đã kết nối Blob Store: ${blobStoreId}`}
             >
               <LogOut className="w-3.5 h-3.5" />
-              <span>Đăng Xuất</span>
+              <span>Khóa Kho Blob</span>
             </button>
           ) : (
             <button
               type="button"
-              onClick={handleGoogleSignIn}
+              onClick={() => setShowAuthModal(true)}
               className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
             >
               <LogIn className="w-3.5 h-3.5" />
-              <span>Đăng Nhập Lưu Kho</span>
+              <span>
+                {isClaimed ? 'Mở Khóa Blob Store' : 'Tạo Mật Khẩu Kho Blob'}
+              </span>
             </button>
           )}
         </div>
       </header>
 
-      {/* Authentication Banner when not signed in */}
-      {isAuthReady && !user && (
+      {/* Inline Blob Store Unlock / First-Run Claim Banner when not unlocked */}
+      {isAuthReady && !sessionToken && (
         <div className="no-print bg-amber-50 border-b border-amber-200 px-6 py-2.5 flex flex-wrap items-center justify-between gap-4">
-          <div className="text-xs text-amber-900">
-            <span className="font-semibold">Kho hàng đã tích hợp sẵn {formatVND(allProducts.length)} mã hàng tạp hóa Việt Nam (893...):</span> Để lưu thay đổi giá bán lẻ và lịch sử hóa đơn vĩnh viễn vào Cloud CSDL, vui lòng đăng nhập Google.
+          <div className="text-xs text-amber-950">
+            <span className="font-bold">
+              Cơ sở dữ liệu Vercel Blob Store (taphoadungcanh-blob):
+            </span>{' '}
+            {isClaimed
+              ? 'Nhập mật khẩu quản lý cửa hàng để đồng bộ giá bán lẻ, tồn kho và hóa đơn trực tiếp lên taphoadungcanh-blob.'
+              : 'Lần đầu sử dụng: Tạo mật khẩu quản lý cửa hàng (từ 4 ký tự) để kích hoạt lưu trữ tự động vào taphoadungcanh-blob.'}
           </div>
+          <form
+            onSubmit={handleClaimOrLoginBlobStore}
+            className="flex items-center gap-2"
+          >
+            <input
+              type="password"
+              value={passcodeInput}
+              onChange={(e) => setPasscodeInput(e.target.value)}
+              placeholder={
+                isClaimed
+                  ? 'Nhập mật khẩu cửa hàng...'
+                  : 'Đặt mật khẩu mới (VD: 1234)...'
+              }
+              className="px-3 py-1.5 text-xs bg-white border border-amber-300 rounded-lg focus:border-slate-900 focus:outline-none w-52"
+            />
+            <button
+              type="submit"
+              disabled={isAuthenticating}
+              className="px-3.5 py-1.5 bg-slate-900 text-white text-xs font-semibold rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {isAuthenticating
+                ? 'Đang kết nối...'
+                : isClaimed
+                  ? 'Mở Khóa Ngay'
+                  : 'Kích Hoạt & Lưu Blob'}
+            </button>
+          </form>
+        </div>
+      )}
+
+      {blobSyncNotice && (
+        <div className="no-print bg-emerald-50 border-b border-emerald-200 px-6 py-2 text-xs text-emerald-900 flex items-center justify-between">
+          <span>
+            {blobSyncNotice}{' '}
+            {blobConnected
+              ? '(Đang đồng bộ trực tuyến với Vercel Blob: taphoadungcanh-blob)'
+              : '(Chế độ lưu đệm cục bộ · Thêm BLOB_READ_WRITE_TOKEN vào Secrets để đồng bộ Cloud)'}
+          </span>
           <button
             type="button"
-            onClick={handleGoogleSignIn}
-            className="px-3 py-1.5 bg-slate-900 text-white text-xs font-semibold rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            onClick={() => setBlobSyncNotice('')}
+            className="text-emerald-700 hover:text-emerald-950"
           >
-            Đăng nhập Google ngay
+            <X className="w-4 h-4" />
           </button>
         </div>
       )}
@@ -1044,16 +1711,50 @@ export default function App() {
                   <Plus className="w-3.5 h-3.5" />
                   <span>Tạo Phiếu Mới (Khách Chờ)</span>
                 </button>
+
+                <button
+                  type="button"
+                  onClick={handleDuplicateActiveOrderTab}
+                  className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  title="Tạo một phiếu bản sao giống hệt phiếu đang mở"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Nhân Bản Phiếu</span>
+                </button>
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={isSavingInvoice}
+                  onClick={() => handleSaveCopyOfBillToHistory()}
+                  className="px-3 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  title="Lưu một bản sao của phiếu hiện tại vào Lịch Sử Bill mà không xóa món trên phiếu"
+                >
+                  <Copy className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Lưu Bản Sao</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={isSavingInvoice}
+                  onClick={handleUpdateSavedBillInHistory}
+                  className="px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  title="Cập nhật đè vào bản lưu hóa đơn hiện tại trong Lịch Sử Bill"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>
+                    {activeOrderTab.savedInvoiceCode
+                      ? `Cập Nhật Bản Lưu (${activeOrderTab.savedInvoiceCode})`
+                      : 'Cập Nhật Bản Lưu'}
+                  </span>
+                </button>
                 <button
                   type="button"
                   onClick={() => setActiveSection('invoices')}
                   className="px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   <QrCode className="w-3.5 h-3.5" />
-                  <span>Cài đặt Mã QR Ngân hàng</span>
+                  <span>Cài đặt Mã QR</span>
                 </button>
                 <button
                   type="button"
@@ -1061,7 +1762,7 @@ export default function App() {
                   className="px-3 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   <PackagePlus className="w-3.5 h-3.5" />
-                  <span>Quét thêm sản phẩm mới</span>
+                  <span>Quét thêm SP mới</span>
                 </button>
               </div>
             </div>
@@ -1157,17 +1858,28 @@ export default function App() {
                       <table className="w-full text-left border-collapse">
                         <thead>
                           <tr className="border-b border-slate-200 text-[11px] font-semibold text-slate-500">
-                            <th className="py-2 pr-2">Tên hàng hóa (Sửa trực tiếp)</th>
+                            <th className="py-2 pr-2">
+                              Tên hàng hóa (Sửa trực tiếp)
+                            </th>
                             <th className="py-2 px-2 w-20">ĐVT</th>
-                            <th className="py-2 px-2 w-28 text-center">Số lượng</th>
-                            <th className="py-2 px-2 w-32 text-right">Đơn giá (đ)</th>
-                            <th className="py-2 pl-2 w-28 text-right">Thành tiền</th>
+                            <th className="py-2 px-2 w-28 text-center">
+                              Số lượng
+                            </th>
+                            <th className="py-2 px-2 w-32 text-right">
+                              Đơn giá (đ)
+                            </th>
+                            <th className="py-2 pl-2 w-28 text-right">
+                              Thành tiền
+                            </th>
                             <th className="py-2 pl-2 w-8"></th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100 text-xs">
                           {activeOrderTab.items.map((item) => (
-                            <tr key={item.lineId} className="hover:bg-slate-50/80">
+                            <tr
+                              key={item.lineId}
+                              className="hover:bg-slate-50/80"
+                            >
                               <td className="py-2 pr-2">
                                 <input
                                   type="text"
@@ -1265,7 +1977,9 @@ export default function App() {
                               <td className="py-2 pl-2 text-right">
                                 <button
                                   type="button"
-                                  onClick={() => handleRemoveBillItem(item.lineId)}
+                                  onClick={() =>
+                                    handleRemoveBillItem(item.lineId)
+                                  }
                                   className="p-1 text-slate-400 hover:text-red-600"
                                   title="Xóa món"
                                 >
@@ -1340,7 +2054,10 @@ export default function App() {
                           onChange={(e) =>
                             updateActiveTab((t) => ({
                               ...t,
-                              discount: Math.max(0, Number(e.target.value) || 0),
+                              discount: Math.max(
+                                0,
+                                Number(e.target.value) || 0
+                              ),
                             }))
                           }
                           className="w-32 px-2.5 py-1 text-right font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg"
@@ -1499,7 +2216,7 @@ export default function App() {
           <div className="max-w-4xl mx-auto space-y-5">
             <BarcodeAutoModal
               existingProducts={allProducts}
-              onSaveProduct={handleSaveProductToFirestore}
+              onSaveProduct={handleSaveProductToBlobStore}
               isEmbedded={true}
             />
           </div>
@@ -1516,26 +2233,34 @@ export default function App() {
                   Kho Hàng Tạp Hóa Dung Cảnh ({formatVND(allProducts.length)} mã hàng Việt Nam)
                 </h1>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Đã tích hợp sẵn hơn {formatVND(allProducts.length)} mã vạch hàng tiêu dùng Việt Nam (đầu số 893...) vào kho hàng. Bấm sửa bất kỳ mặt hàng nào để điều chỉnh giá bán & tồn kho.
+                  Đã tích hợp sẵn hơn {formatVND(allProducts.length)} mã vạch hàng tiêu dùng Việt Nam (đầu số 893...) và kết nối trực tiếp vào cơ sở dữ liệu taphoadungcanh-blob.
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                {user && (
-                  <button
-                    type="button"
-                    disabled={isBatchSyncing}
-                    onClick={handleBatchSyncVisiblePageToFirestore}
-                    className="px-3.5 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                    title="Đồng bộ 50 mặt hàng trên trang hiện tại lên Cloud Firestore"
-                  >
-                    <Database className="w-3.5 h-3.5" />
-                    <span>
-                      {isBatchSyncing
-                        ? 'Đang đồng bộ trang này lên CSDL...'
-                        : 'Lưu trang này lên Cloud CSDL'}
-                    </span>
-                  </button>
-                )}
+                <button
+                  type="button"
+                  disabled={isBackupWorking}
+                  onClick={handleCreateDatabaseBackupCopy}
+                  className="px-3.5 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  title="Lưu bản sao toàn bộ kho hàng & hóa đơn lên Blob Store và tải tệp JSON về máy"
+                >
+                  <Copy className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Lưu Bản Sao Kho</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={isBatchSyncing || isBackupWorking}
+                  onClick={handleBatchSyncVisiblePageToBlobStore}
+                  className="px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  title="Cập nhật bản lưu 50 mặt hàng trên trang hiện tại lên taphoadungcanh-blob"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>
+                    {isBatchSyncing
+                      ? 'Đang cập nhật bản lưu...'
+                      : 'Cập Nhật Bản Lưu Trang Này'}
+                  </span>
+                </button>
                 <button
                   type="button"
                   onClick={() => setActiveSection('barcode_add')}
@@ -1616,7 +2341,9 @@ export default function App() {
                   type="button"
                   disabled={inventoryPage >= totalInventoryPages}
                   onClick={() =>
-                    setInventoryPage((p) => Math.min(totalInventoryPages, p + 1))
+                    setInventoryPage((p) =>
+                      Math.min(totalInventoryPages, p + 1)
+                    )
                   }
                   className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 rounded-md font-medium flex items-center gap-1 cursor-pointer"
                 >
@@ -1669,7 +2396,7 @@ export default function App() {
                               <span>{prod.name}</span>
                               {prod.isCustomOrEdited && (
                                 <span className="ml-2 text-[11px] font-normal text-emerald-700">
-                                  · Đã lưu Cloud
+                                  · Đã lưu Blob Store
                                 </span>
                               )}
                             </div>
@@ -1791,7 +2518,7 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={async () => {
-                                    await handleSaveProductToFirestore(
+                                    await handleSaveProductToBlobStore(
                                       {
                                         barcode: prod.barcode,
                                         name: editDraft.name,
@@ -1860,8 +2587,9 @@ export default function App() {
                                   type="button"
                                   onClick={() => {
                                     setConfirmDialog({
-                                      title: 'Xác nhận xóa sản phẩm khỏi Kho Hàng',
-                                      message: `Bạn có chắc chắn muốn xóa sản phẩm "${prod.name}" (Mã vạch: ${prod.barcode}) khỏi Kho Hàng không?`,
+                                      title:
+                                        'Xác nhận xóa sản phẩm khỏi Kho Hàng',
+                                      message: `Bạn có chắc chắn muốn xóa sản phẩm "${prod.name}" (Mã vạch: ${prod.barcode}) khỏi Kho Hàng taphoadungcanh-blob không?`,
                                       confirmLabel: 'Chắc chắn xóa sản phẩm',
                                       onConfirm: async () => {
                                         const nextDeleted = {
@@ -1869,6 +2597,11 @@ export default function App() {
                                           [prod.barcode]: true,
                                         };
                                         setDeletedBarcodes(nextDeleted);
+                                        setDbProducts((prev) =>
+                                          prev.filter(
+                                            (p) => p.barcode !== prod.barcode
+                                          )
+                                        );
                                         try {
                                           localStorage.setItem(
                                             'dung_canh_deleted_barcodes',
@@ -1877,17 +2610,22 @@ export default function App() {
                                         } catch {
                                           // Ignore
                                         }
-                                        if (prod.isCustomOrEdited && user) {
+                                        if (sessionToken) {
                                           try {
-                                            await deleteDoc(
-                                              doc(db, 'products', prod.id)
+                                            await fetch(
+                                              `/api/db/products/${encodeURIComponent(prod.barcode)}`,
+                                              {
+                                                method: 'DELETE',
+                                                headers: {
+                                                  Authorization: `Bearer ${sessionToken}`,
+                                                },
+                                              }
                                             );
-                                          } catch (err) {
-                                            handleFirestoreError(
-                                              err,
-                                              OperationType.DELETE,
-                                              `products/${prod.id}`
+                                            setBlobSyncNotice(
+                                              `Đã xóa mã hàng ${prod.barcode} khỏi taphoadungcanh-blob.`
                                             );
+                                          } catch {
+                                            // Ignore network error
                                           }
                                         }
                                       },
@@ -1920,7 +2658,7 @@ export default function App() {
             <div className="no-print lg:col-span-7 space-y-4">
               {/* BANK QR CONFIGURATION PANEL IN LỊCH SỬ BILL */}
               <div className="bg-white border border-slate-200 rounded-xl p-5">
-                <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-200">
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-3 mb-4 border-b border-slate-200">
                   <div>
                     <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
                       <QrCode className="w-4 h-4 text-emerald-600" />
@@ -1932,6 +2670,19 @@ export default function App() {
                       Mã QR này được in ở cuối tờ hóa đơn giấy nhiệt (thay cho mã vạch khách hàng cũ) để khách quét chuyển khoản nhanh.
                     </p>
                   </div>
+                  <button
+                    type="button"
+                    disabled={isSavingProfile}
+                    onClick={() => handleSaveProfileToBlobStore()}
+                    className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>
+                      {isSavingProfile
+                        ? 'Đang lưu lên Blob...'
+                        : 'Lưu Mã QR lên taphoadungcanh-blob'}
+                    </span>
+                  </button>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center">
@@ -2043,10 +2794,17 @@ export default function App() {
                                     'Bạn có chắc chắn muốn xóa ảnh Mã QR riêng đã tải lên và chuyển về mã VietQR tự động không?',
                                   confirmLabel: 'Chắc chắn xóa ảnh QR',
                                   onConfirm: () => {
-                                    setStoreProfile({
+                                    const nextProfile = {
                                       ...storeProfile,
                                       customQrDataUrl: '',
-                                    });
+                                    };
+                                    setStoreProfile(nextProfile);
+                                    if (sessionToken) {
+                                      handleSaveProfileToBlobStore(
+                                        nextProfile,
+                                        true
+                                      );
+                                    }
                                   },
                                 })
                               }
@@ -2091,9 +2849,19 @@ export default function App() {
 
               {/* Store Thermal Print Header Configuration */}
               <div className="bg-white border border-slate-200 rounded-xl p-5">
-                <h2 className="text-sm font-bold text-slate-900 mb-3">
-                  Thông Tin Đầu Hóa Đơn Giấy Nhiệt ({storeProfile.storeName})
-                </h2>
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm font-bold text-slate-900">
+                    Thông Tin Đầu Hóa Đơn Giấy Nhiệt ({storeProfile.storeName})
+                  </h2>
+                  <button
+                    type="button"
+                    disabled={isSavingProfile}
+                    onClick={() => handleSaveProfileToBlobStore()}
+                    className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg cursor-pointer"
+                  >
+                    Lưu thông tin cửa hàng
+                  </button>
+                </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
                   <div>
                     <label className="block font-semibold text-slate-600 mb-1">
@@ -2146,15 +2914,69 @@ export default function App() {
                 </div>
               </div>
 
+              {/* BACKUP COPY & UPDATE SAVED RECORD PANEL ("Lưu Bản Sao & Cập Nhật Bản Lưu CSDL") */}
+              <div className="bg-white border border-slate-200 rounded-xl p-5">
+                <div className="flex flex-wrap items-center justify-between gap-3 pb-3 mb-3 border-b border-slate-200">
+                  <div>
+                    <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                      <Database className="w-4 h-4 text-emerald-600" />
+                      <span>
+                        Sao Lưu & Cập Nhật Bản Lưu Cơ Sở Dữ Liệu (taphoadungcanh-blob)
+                      </span>
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Lưu bản sao dự phòng toàn bộ cửa hàng (sản phẩm, giá bán, hóa đơn, mã QR) hoặc cập nhật đè vào bản lưu chính trên Blob Store.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <button
+                    type="button"
+                    disabled={isBackupWorking}
+                    onClick={handleCreateDatabaseBackupCopy}
+                    className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>
+                      {isBackupWorking
+                        ? 'Đang xử lý...'
+                        : 'Lưu Bản Sao CSDL (Cloud & Tải JSON)'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isBackupWorking}
+                    onClick={handleUpdateSavedDatabaseOnBlob}
+                    className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Cập Nhật Bản Lưu Hiện Tại Lên Blob Store</span>
+                  </button>
+
+                  <label className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer">
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>Nạp Tệp Bản Sao (.json)</span>
+                    <input
+                      type="file"
+                      accept=".json,application/json"
+                      onChange={handleImportBackupCopyFile}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+              </div>
+
               {/* Invoices Table */}
               <div className="bg-white border border-slate-200 rounded-xl p-5">
                 <div className="flex items-center justify-between pb-3 mb-3 border-b border-slate-200">
                   <div>
                     <h2 className="text-base font-bold text-slate-900">
-                      Lịch Sử Hóa Đơn Đã Lưu ({invoices.length} phiếu)
+                      Lịch Sử Hóa Đơn Trong taphoadungcanh-blob ({invoices.length} phiếu)
                     </h2>
                     <p className="text-xs text-slate-500">
-                      Bấm vào bất kỳ hóa đơn nào để xem lại và in lại ra máy in giấy nhiệt (kèm mã QR ngân hàng).
+                      Bấm vào bất kỳ hóa đơn nào để xem lại, lưu bản sao mới, hoặc mở lên sửa rồi cập nhật bản lưu.
                     </p>
                   </div>
                   <div className="text-right">
@@ -2172,7 +2994,7 @@ export default function App() {
 
                 {invoices.length === 0 ? (
                   <div className="py-10 text-center text-xs text-slate-500">
-                    Chưa có hóa đơn nào được lưu. Khi thanh toán & in ở mục Lên Bill, hóa đơn sẽ tự động lưu tại đây.
+                    Chưa có hóa đơn nào được lưu. Khi thanh toán & in hoặc bấm "Lưu Bản Sao" ở mục Lên Bill, hóa đơn sẽ tự động lưu vào taphoadungcanh-blob.
                   </div>
                 ) : (
                   <div className="divide-y divide-slate-100">
@@ -2212,7 +3034,31 @@ export default function App() {
                             <div className="text-xs font-bold font-mono tabular-nums text-slate-900">
                               {formatVND(inv.totalAmount)} đ
                             </div>
-                            <div className="flex items-center justify-end gap-2 mt-0.5">
+                            <div className="flex flex-wrap items-center justify-end gap-2.5 mt-1">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleLoadInvoiceToPosForUpdate(inv);
+                                }}
+                                className="text-[11px] text-slate-700 hover:text-slate-950 hover:underline font-medium inline-flex items-center gap-1 cursor-pointer"
+                                title="Mở hóa đơn này sang mục Lên Bill để sửa và cập nhật bản lưu"
+                              >
+                                <RefreshCw className="w-3 h-3" />
+                                <span>Sửa & Cập nhật bản lưu</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleSaveCopyOfBillToHistory(inv);
+                                }}
+                                className="text-[11px] text-emerald-700 hover:underline font-medium inline-flex items-center gap-1 cursor-pointer"
+                                title="Tạo một bản sao mới từ hóa đơn này"
+                              >
+                                <Copy className="w-3 h-3" />
+                                <span>Lưu bản sao</span>
+                              </button>
                               <button
                                 type="button"
                                 onClick={(e) => {
@@ -2231,24 +3077,36 @@ export default function App() {
                                   e.stopPropagation();
                                   setConfirmDialog({
                                     title: 'Xác nhận xóa hóa đơn đã lưu',
-                                    message: `Bạn có chắc chắn muốn xóa hóa đơn "${inv.invoiceCode}" (${formatVND(inv.totalAmount)} đ) khỏi lịch sử không?`,
+                                    message: `Bạn có chắc chắn muốn xóa hóa đơn "${inv.invoiceCode}" (${formatVND(inv.totalAmount)} đ) khỏi lịch sử taphoadungcanh-blob không?`,
                                     confirmLabel: 'Chắc chắn xóa hóa đơn',
                                     onConfirm: async () => {
-                                      try {
-                                        await deleteDoc(
-                                          doc(db, 'invoices', inv.id)
-                                        );
-                                        if (
-                                          selectedHistoryInvoice?.id === inv.id
-                                        ) {
-                                          setSelectedHistoryInvoice(null);
+                                      setInvoices((prev) =>
+                                        prev.filter(
+                                          (item) => item.id !== inv.id
+                                        )
+                                      );
+                                      if (
+                                        selectedHistoryInvoice?.id === inv.id
+                                      ) {
+                                        setSelectedHistoryInvoice(null);
+                                      }
+                                      if (sessionToken) {
+                                        try {
+                                          await fetch(
+                                            `/api/db/invoices/${encodeURIComponent(inv.id)}`,
+                                            {
+                                              method: 'DELETE',
+                                              headers: {
+                                                Authorization: `Bearer ${sessionToken}`,
+                                              },
+                                            }
+                                          );
+                                          setBlobSyncNotice(
+                                            `Đã xóa hóa đơn ${inv.invoiceCode} khỏi taphoadungcanh-blob.`
+                                          );
+                                        } catch {
+                                          // Ignore
                                         }
-                                      } catch (err) {
-                                        handleFirestoreError(
-                                          err,
-                                          OperationType.DELETE,
-                                          `invoices/${inv.id}`
-                                        );
                                       }
                                     },
                                   });
@@ -2357,9 +3215,84 @@ export default function App() {
           <BarcodeAutoModal
             initialBarcode={autoModalBarcode}
             existingProducts={allProducts}
-            onSaveProduct={handleSaveProductToFirestore}
+            onSaveProduct={handleSaveProductToBlobStore}
             onClose={() => setAutoModalBarcode(null)}
           />
+        </div>
+      )}
+
+      {/* Modal for Unlocking / Claiming Vercel Blob Store (taphoadungcanh-blob) */}
+      {showAuthModal && (
+        <div className="no-print fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-xl max-w-md w-full p-5 shadow-lg">
+            <div className="flex items-start justify-between gap-3 pb-3 mb-4 border-b border-slate-200">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-emerald-50 text-emerald-700 rounded-lg">
+                  <KeyRound className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">
+                    {isClaimed
+                      ? 'Mở Khóa Kho Dữ Liệu taphoadungcanh-blob'
+                      : 'Thiết Lập Mật Khẩu Kho taphoadungcanh-blob'}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Vercel Blob Store · ID: {blobStoreId}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAuthModal(false)}
+                className="text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleClaimOrLoginBlobStore} className="space-y-4">
+              <p className="text-xs text-slate-600 leading-relaxed">
+                {isClaimed
+                  ? 'Nhập mật khẩu quản lý cửa hàng đã tạo để đồng bộ hóa đơn, giá bán lẻ, tồn kho và cấu hình Mã QR với taphoadungcanh-blob.'
+                  : 'Lần đầu kết nối với taphoadungcanh-blob: Hãy đặt mật khẩu quản lý cửa hàng (từ 4 ký tự). Mật khẩu này được mã hóa bảo mật (AES-256-GCM + Scrypt) trực tiếp vào Blob Store.'}
+              </p>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Mật khẩu quản lý cửa hàng
+                </label>
+                <input
+                  type="password"
+                  autoFocus
+                  value={passcodeInput}
+                  onChange={(e) => setPasscodeInput(e.target.value)}
+                  placeholder="Nhập mật khẩu (tối thiểu 4 ký tự)..."
+                  className="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-lg focus:bg-white focus:border-emerald-600 focus:outline-none"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAuthModal(false)}
+                  className="px-4 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
+                >
+                  Đóng
+                </button>
+                <button
+                  type="submit"
+                  disabled={isAuthenticating}
+                  className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg cursor-pointer"
+                >
+                  {isAuthenticating
+                    ? 'Đang xác thực...'
+                    : isClaimed
+                      ? 'Mở Khóa & Đồng Bộ'
+                      : 'Tạo Mật Khẩu & Kích Hoạt'}
+                </button>
+              </div>
+            </form>
+          </div>
         </div>
       )}
 

@@ -37,6 +37,12 @@ export interface PosOrderTab {
   items: BillLineItem[];
   discount: number;
   amountTendered: number;
+  /**
+   * Tracks if this tab has already been saved to Lịch sử bill so the user can either
+   * "Cập nhật bản lưu" (update existing saved record) or "Lưu bản sao" (save a new copy).
+   */
+  savedInvoiceId?: string;
+  savedInvoiceCode?: string;
 }
 
 export interface InvoiceRecord {
