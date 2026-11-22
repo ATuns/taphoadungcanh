@@ -191,20 +191,215 @@ function decryptCredentialPayload(
   }
 }
 
+function sanitizeBlobToken(raw: string): string {
+  return raw.replace(/^["']+|["']+$/g, '').trim();
+}
+
 function getBlobToken(): string {
-  const direct = (
+  const direct = sanitizeBlobToken(
     process.env.BLOB_READ_WRITE_TOKEN ||
-    process.env.TAPHOADUNGCANH_BLOB_READ_WRITE_TOKEN ||
-    ''
-  ).trim();
-  if (direct && direct !== 'MY_BLOB_TOKEN') return direct;
+      process.env.TAPHOADUNGCANH_BLOB_READ_WRITE_TOKEN ||
+      ''
+  );
+  if (direct && direct !== 'MY_BLOB_TOKEN' && direct.startsWith('vercel_blob_rw_')) {
+    return direct;
+  }
 
   for (const val of Object.values(process.env)) {
-    if (typeof val === 'string' && val.trim().startsWith('vercel_blob_rw_')) {
-      return val.trim();
+    if (typeof val === 'string') {
+      const cleaned = sanitizeBlobToken(val);
+      if (cleaned.startsWith('vercel_blob_rw_')) {
+        return cleaned;
+      }
     }
   }
   return '';
+}
+
+const FIRESTORE_SHARED_DOC_URL =
+  'https://firestore.googleapis.com/v1/projects/smooth-codex-mbcxw/databases/ai-studio-4d5eb67f-7b1c-4f86-b99d-19b94ba04a45/documents/taphoadungcanh_blob/database';
+
+async function readFromCloudFirestoreRest(): Promise<TapHoaBlobDatabase | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    const res = await fetch(FIRESTORE_SHARED_DOC_URL, {
+      method: 'GET',
+      headers: { 'Cache-Control': 'no-cache' },
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timer));
+
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      fields?: Record<string, { stringValue?: string }>;
+    };
+    const f = data?.fields;
+    if (!f || !f.updatedAtIso?.stringValue) return null;
+
+    const storeProfile = f.storeProfileJson?.stringValue
+      ? (JSON.parse(f.storeProfileJson.stringValue) as Partial<BlobStoreProfile>)
+      : {};
+    const products = f.productsJson?.stringValue
+      ? (JSON.parse(f.productsJson.stringValue) as Record<string, BlobProductRecord>)
+      : {};
+    const deletedBarcodes = f.deletedBarcodesJson?.stringValue
+      ? (JSON.parse(f.deletedBarcodesJson.stringValue) as Record<string, boolean>)
+      : {};
+    const invoices = f.invoicesJson?.stringValue
+      ? (JSON.parse(f.invoicesJson.stringValue) as BlobInvoiceRecord[])
+      : [];
+    const orderTabs = f.orderTabsJson?.stringValue
+      ? (JSON.parse(f.orderTabsJson.stringValue) as BlobPosOrderTab[])
+      : [];
+
+    return {
+      ...createEmptyDatabase(),
+      storeId: f.storeId?.stringValue || 'store_fEebWPRqDwMcS4oB',
+      updatedAtIso: f.updatedAtIso.stringValue,
+      hasPersistedData: true,
+      storeProfile: {
+        ...DEFAULT_STORE_PROFILE,
+        ...storeProfile,
+      },
+      products: products && typeof products === 'object' ? products : {},
+      deletedBarcodes:
+        deletedBarcodes && typeof deletedBarcodes === 'object'
+          ? deletedBarcodes
+          : {},
+      invoices: Array.isArray(invoices) ? invoices : [],
+      orderTabs: Array.isArray(orderTabs) ? orderTabs : [],
+      activeTabId: f.activeTabId?.stringValue || '',
+      currentInvoiceCode: f.currentInvoiceCode?.stringValue || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writeToCloudFirestoreRest(
+  dbData: TapHoaBlobDatabase
+): Promise<boolean> {
+  try {
+    const safeStoreProfile = {
+      ...DEFAULT_STORE_PROFILE,
+      ...dbData.storeProfile,
+      customQrDataUrl: (dbData.storeProfile?.customQrDataUrl || '').slice(
+        0,
+        220000
+      ),
+    };
+    const firestorePayload = {
+      fields: {
+        storeId: {
+          stringValue: String(
+            dbData.storeId || 'store_fEebWPRqDwMcS4oB'
+          ).slice(0, 64),
+        },
+        updatedAtIso: {
+          stringValue: String(
+            dbData.updatedAtIso || new Date().toISOString()
+          ).slice(0, 64),
+        },
+        storeProfileJson: {
+          stringValue: JSON.stringify(safeStoreProfile).slice(0, 300000),
+        },
+        productsJson: {
+          stringValue: JSON.stringify(dbData.products || {}).slice(0, 350000),
+        },
+        deletedBarcodesJson: {
+          stringValue: JSON.stringify(dbData.deletedBarcodes || {}).slice(
+            0,
+            100000
+          ),
+        },
+        invoicesJson: {
+          stringValue: JSON.stringify(
+            (dbData.invoices || []).slice(0, 400)
+          ).slice(0, 300000),
+        },
+        orderTabsJson: {
+          stringValue: JSON.stringify(
+            (dbData.orderTabs || []).slice(0, 20)
+          ).slice(0, 150000),
+        },
+        activeTabId: {
+          stringValue:
+            String(dbData.activeTabId || 'tab_1').slice(0, 100) || 'tab_1',
+        },
+        currentInvoiceCode: {
+          stringValue:
+            String(dbData.currentInvoiceCode || 'DC-0001').slice(0, 64) ||
+            'DC-0001',
+        },
+      },
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    const res = await fetch(FIRESTORE_SHARED_DOC_URL, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(firestorePayload),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timer));
+
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function mergeDatabaseSnapshots(
+  primary: TapHoaBlobDatabase,
+  secondary: TapHoaBlobDatabase | null
+): TapHoaBlobDatabase {
+  if (!secondary || !secondary.hasPersistedData) return primary;
+  if (!primary.hasPersistedData) return secondary;
+
+  const primaryTime = primary.updatedAtIso
+    ? new Date(primary.updatedAtIso).getTime()
+    : 0;
+  const secondaryTime = secondary.updatedAtIso
+    ? new Date(secondary.updatedAtIso).getTime()
+    : 0;
+
+  const newer = secondaryTime > primaryTime ? secondary : primary;
+  const older = secondaryTime > primaryTime ? primary : secondary;
+
+  const mergedDeleted: Record<string, boolean> = {
+    ...(older.deletedBarcodes || {}),
+    ...(newer.deletedBarcodes || {}),
+  };
+
+  const mergedProducts: Record<string, BlobProductRecord> = {
+    ...(older.products || {}),
+    ...(newer.products || {}),
+  };
+  for (const code of Object.keys(mergedDeleted)) {
+    if (mergedDeleted[code]) {
+      delete mergedProducts[code];
+    }
+  }
+
+  const seenInv = new Set<string>();
+  const mergedInvoices: BlobInvoiceRecord[] = [];
+  for (const inv of [...(newer.invoices || []), ...(older.invoices || [])]) {
+    if (!inv || !inv.id || seenInv.has(inv.id)) continue;
+    seenInv.add(inv.id);
+    mergedInvoices.push(inv);
+  }
+
+  return {
+    ...newer,
+    hasPersistedData: true,
+    products: mergedProducts,
+    deletedBarcodes: mergedDeleted,
+    invoices: mergedInvoices.slice(0, 2000),
+    orderTabs:
+      Array.isArray(newer.orderTabs) && newer.orderTabs.length > 0
+        ? newer.orderTabs
+        : older.orderTabs || [],
+  };
 }
 
 async function readStreamToString(
@@ -251,16 +446,17 @@ async function loadBlobDatabase(
   const token = getBlobToken();
   const now = Date.now();
 
-  if (cachedDb && !forceRefresh && now - lastBlobFetchMs < 1500) {
+  if (cachedDb && !forceRefresh && now - lastBlobFetchMs < 1200) {
     return cachedDb;
   }
 
-  // 1. Read from Vercel Blob Store (taphoadungcanh-blob/database.json)
+  let vercelBlobDb: TapHoaBlobDatabase | null = null;
+
+  // 1. Read from Vercel Blob Store (taphoadungcanh-blob/database.json) if token is available
   if (token) {
     try {
       let rawText: string | null = null;
 
-      // Step 1a: Try direct private get with useCache: false
       try {
         const privateRes = await get(BLOB_PATHNAME, {
           access: 'private',
@@ -278,8 +474,6 @@ async function loadBlobDatabase(
         // Proceed to public / list fallback
       }
 
-      // Step 1b: Note that @vercel/blob get() returns null on 404 without throwing!
-      // If private get returned null or threw, try direct public get:
       if (!rawText) {
         try {
           const publicRes = await get(BLOB_PATHNAME, {
@@ -299,7 +493,6 @@ async function loadBlobDatabase(
         }
       }
 
-      // Step 1c: If still not found by pathname, query list() metadata API (never edge-cached)
       if (!rawText) {
         try {
           const { blobs } = await list({
@@ -337,7 +530,7 @@ async function loadBlobDatabase(
 
       if (rawText) {
         const parsed = JSON.parse(rawText) as Partial<TapHoaBlobDatabase>;
-        cachedDb = {
+        vercelBlobDb = {
           ...createEmptyDatabase(),
           ...parsed,
           hasPersistedData: true,
@@ -349,8 +542,6 @@ async function loadBlobDatabase(
           deletedBarcodes: parsed.deletedBarcodes || {},
           invoices: Array.isArray(parsed.invoices) ? parsed.invoices : [],
         };
-        lastBlobFetchMs = now;
-        return cachedDb;
       }
     } catch (err) {
       console.error(
@@ -360,12 +551,16 @@ async function loadBlobDatabase(
     }
   }
 
-  // 2. Fallback to local file snapshot if Blob Store is empty or token not configured yet
+  // 2. Read from shared Cloud Firestore (taphoadungcanh_blob/database) so AI Studio Preview, GitHub, and Vercel always share state
+  const firestoreDbSnap = await readFromCloudFirestoreRest();
+
+  // 3. Read local file snapshot if available
+  let localFileDb: TapHoaBlobDatabase | null = null;
   try {
     if (fs.existsSync(LOCAL_FALLBACK_FILE)) {
       const raw = fs.readFileSync(LOCAL_FALLBACK_FILE, 'utf8');
       const parsed = JSON.parse(raw) as Partial<TapHoaBlobDatabase>;
-      cachedDb = {
+      localFileDb = {
         ...createEmptyDatabase(),
         ...parsed,
         hasPersistedData: true,
@@ -377,22 +572,35 @@ async function loadBlobDatabase(
         deletedBarcodes: parsed.deletedBarcodes || {},
         invoices: Array.isArray(parsed.invoices) ? parsed.invoices : [],
       };
-      lastBlobFetchMs = now;
-      // If token is present and Blob Store was empty, seed initial snapshot to Vercel Blob automatically
-      if (token) {
-        putBlobWithPrivateFirst(
-          BLOB_PATHNAME,
-          JSON.stringify(cachedDb, null, 2),
-          token
-        ).catch(() => {});
-      }
-      return cachedDb;
     }
   } catch {
     // Ignore local file read errors
   }
 
-  cachedDb = createEmptyDatabase();
+  let resolved = createEmptyDatabase();
+  if (localFileDb) {
+    resolved = mergeDatabaseSnapshots(resolved, localFileDb);
+  }
+  if (firestoreDbSnap) {
+    resolved = mergeDatabaseSnapshots(resolved, firestoreDbSnap);
+  }
+  if (vercelBlobDb) {
+    resolved = mergeDatabaseSnapshots(resolved, vercelBlobDb);
+  }
+
+  // If local had data that wasn't in Cloud Firestore yet, seed Cloud Firestore automatically
+  if (resolved.hasPersistedData && !firestoreDbSnap) {
+    writeToCloudFirestoreRest(resolved).catch(() => {});
+  }
+  if (resolved.hasPersistedData && token && !vercelBlobDb) {
+    putBlobWithPrivateFirst(
+      BLOB_PATHNAME,
+      JSON.stringify(resolved, null, 2),
+      token
+    ).catch(() => {});
+  }
+
+  cachedDb = resolved;
   lastBlobFetchMs = now;
   return cachedDb;
 }
@@ -409,6 +617,7 @@ function pruneUnmodifiedDefaultCatalogDuplicates(
       prod.name === base.name &&
       prod.price === base.suggestedPrice &&
       prod.costPrice === base.suggestedCostPrice &&
+      prod.stock === base.defaultStock &&
       prod.unit === base.unit &&
       prod.category === base.category
     ) {
@@ -426,28 +635,31 @@ async function saveBlobDatabase(dbData: TapHoaBlobDatabase): Promise<{
 }> {
   dbData.updatedAtIso = new Date().toISOString();
   dbData.hasPersistedData = true;
-  dbData.storeId = process.env.BLOB_STORE_ID || 'taphoadungcanh-blob';
+  dbData.storeId = process.env.BLOB_STORE_ID || 'store_fEebWPRqDwMcS4oB';
   dbData.products = pruneUnmodifiedDefaultCatalogDuplicates(dbData.products);
   cachedDb = dbData;
   lastBlobFetchMs = Date.now();
 
   const serialized = JSON.stringify(dbData, null, 2);
 
-  // Save local snapshot for resilience in dev preview
+  // 1. Save local snapshot for resilience in dev preview
   try {
     fs.writeFileSync(LOCAL_FALLBACK_FILE, serialized, 'utf8');
   } catch {
     // Ignore read-only filesystem on serverless
   }
 
+  // 2. Always sync to shared Cloud Firestore so AI Studio Preview, GitHub, and Vercel stay in sync
+  const savedToFirestorePromise = writeToCloudFirestoreRest(dbData);
+
+  // 3. Save to Vercel Blob Store if token is configured
   const token = getBlobToken();
   if (token) {
     try {
-      const blobResult = await putBlobWithPrivateFirst(
-        BLOB_PATHNAME,
-        serialized,
-        token
-      );
+      const [blobResult] = await Promise.all([
+        putBlobWithPrivateFirst(BLOB_PATHNAME, serialized, token),
+        savedToFirestorePromise,
+      ]);
       return {
         savedToVercelBlob: true,
         blobUrl: blobResult.url,
@@ -460,7 +672,8 @@ async function saveBlobDatabase(dbData: TapHoaBlobDatabase): Promise<{
     }
   }
 
-  return { savedToVercelBlob: false };
+  const firestoreOk = await savedToFirestorePromise;
+  return { savedToVercelBlob: firestoreOk };
 }
 
 // HMAC-SHA256 Bearer Session Token Helpers
@@ -1193,10 +1406,17 @@ export function createApiRouter() {
           };
         }
 
+        if (
+          incoming.deletedBarcodes &&
+          typeof incoming.deletedBarcodes === 'object'
+        ) {
+          dbData.deletedBarcodes = {
+            ...dbData.deletedBarcodes,
+            ...incoming.deletedBarcodes,
+          };
+        }
+
         if (incoming.products && typeof incoming.products === 'object') {
-          if (replaceMode) {
-            dbData.products = {};
-          }
           if (Array.isArray(incoming.products)) {
             for (const p of incoming.products) {
               const code = String(p?.barcode || '')
@@ -1204,6 +1424,7 @@ export function createApiRouter() {
                 .replace(/[^a-zA-Z0-9_-]/g, '')
                 .slice(0, 64);
               if (!code) continue;
+              delete dbData.deletedBarcodes[code];
               dbData.products[code] = {
                 id: `blob_prod_${code}`,
                 barcode: code,
@@ -1216,7 +1437,7 @@ export function createApiRouter() {
                 price: Math.max(0, Math.round(Number(p.price) || 0)),
                 costPrice: Math.max(0, Math.round(Number(p.costPrice) || 0)),
                 stock: Math.max(0, Math.round(Number(p.stock) || 0)),
-                source: String(p.source || 'backup_restore').slice(0, 50),
+                source: String(p.source || 'taphoadungcanh-blob').slice(0, 50),
                 updatedAtIso: new Date().toISOString(),
               };
             }
@@ -1228,6 +1449,7 @@ export function createApiRouter() {
                 .replace(/[^a-zA-Z0-9_-]/g, '')
                 .slice(0, 64);
               if (!code) continue;
+              delete dbData.deletedBarcodes[code];
               dbData.products[code] = {
                 id: `blob_prod_${code}`,
                 barcode: code,
@@ -1240,32 +1462,28 @@ export function createApiRouter() {
                 price: Math.max(0, Math.round(Number(p?.price) || 0)),
                 costPrice: Math.max(0, Math.round(Number(p?.costPrice) || 0)),
                 stock: Math.max(0, Math.round(Number(p?.stock) || 0)),
-                source: String(p?.source || 'backup_restore').slice(0, 50),
+                source: String(p?.source || 'taphoadungcanh-blob').slice(0, 50),
                 updatedAtIso: new Date().toISOString(),
               };
             }
           }
         }
 
-        if (
-          incoming.deletedBarcodes &&
-          typeof incoming.deletedBarcodes === 'object'
-        ) {
-          dbData.deletedBarcodes = replaceMode
-            ? { ...incoming.deletedBarcodes }
-            : {
-                ...dbData.deletedBarcodes,
-                ...incoming.deletedBarcodes,
-              };
+        // Remove any explicitly deleted barcodes
+        for (const delCode of Object.keys(dbData.deletedBarcodes)) {
+          if (dbData.deletedBarcodes[delCode]) {
+            delete dbData.products[delCode];
+          }
         }
 
         if (Array.isArray(incoming.invoices)) {
           const normalizedInvoices: BlobInvoiceRecord[] = [];
           const seenIds = new Set<string>();
 
-          const sourceList = replaceMode
-            ? incoming.invoices
-            : [...incoming.invoices, ...dbData.invoices];
+          const sourceList =
+            replaceMode && incoming.invoices.length > 0
+              ? incoming.invoices
+              : [...incoming.invoices, ...dbData.invoices];
 
           for (const rawInv of sourceList) {
             if (!rawInv || typeof rawInv !== 'object') continue;
@@ -1373,6 +1591,77 @@ export function createApiRouter() {
           error instanceof Error
             ? error.message
             : 'Lỗi cập nhật bản lưu cơ sở dữ liệu.',
+      });
+    }
+  });
+
+  // 9d. Dedicated Non-Destructive POS Order Tabs Sync Endpoint
+  router.put('/api/db/order-tabs', requireAuth, async (req, res) => {
+    try {
+      const body = req.body || {};
+      const dbData = await loadBlobDatabase(true);
+
+      if (Array.isArray(body.orderTabs)) {
+        dbData.orderTabs = body.orderTabs
+          .slice(0, 30)
+          .map((t: Record<string, unknown>, idx: number) => ({
+            id: String(t?.id || `tab_${idx + 1}`),
+            tabNumber: Math.max(1, Number(t?.tabNumber) || idx + 1),
+            label: String(t?.label || `Phiếu ${idx + 1}`).slice(0, 80),
+            customerName: String(t?.customerName || 'Khách lẻ').slice(0, 150),
+            createdAtIso: String(t?.createdAtIso || new Date().toISOString()),
+            items: Array.isArray(t?.items)
+              ? t.items.slice(0, 300).map((item: Record<string, unknown>) => ({
+                  lineId: String(
+                    item?.lineId ||
+                      `line_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+                  ),
+                  productId: item?.productId
+                    ? String(item.productId)
+                    : undefined,
+                  barcode: String(item?.barcode || 'HANG-LE').slice(0, 64),
+                  name: String(item?.name || 'Hàng tạp hóa').slice(0, 200),
+                  unit: String(item?.unit || 'Cái').slice(0, 50),
+                  price: Math.max(0, Math.round(Number(item?.price) || 0)),
+                  quantity: Math.max(
+                    1,
+                    Math.round(Number(item?.quantity) || 1)
+                  ),
+                }))
+              : [],
+            discount: Math.max(0, Math.round(Number(t?.discount) || 0)),
+            amountTendered: Math.max(
+              0,
+              Math.round(Number(t?.amountTendered) || 0)
+            ),
+            savedInvoiceId: t?.savedInvoiceId
+              ? String(t.savedInvoiceId)
+              : undefined,
+            savedInvoiceCode: t?.savedInvoiceCode
+              ? String(t.savedInvoiceCode)
+              : undefined,
+          }));
+      }
+
+      if (typeof body.activeTabId === 'string') {
+        dbData.activeTabId = body.activeTabId.slice(0, 100);
+      }
+      if (typeof body.currentInvoiceCode === 'string') {
+        dbData.currentInvoiceCode = body.currentInvoiceCode.slice(0, 64);
+      }
+
+      const saveRes = await saveBlobDatabase(dbData);
+      return res.json({
+        updatedAtIso: dbData.updatedAtIso,
+        tabCount: Array.isArray(dbData.orderTabs) ? dbData.orderTabs.length : 0,
+        savedToVercelBlob: saveRes.savedToVercelBlob,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Lỗi đồng bộ phiếu bán hàng.',
       });
     }
   });

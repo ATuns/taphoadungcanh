@@ -115,6 +115,40 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
+    function isValidSharedBlobDatabase(data) {
+      return data.keys().hasAll([
+          'storeId',
+          'updatedAtIso',
+          'storeProfileJson',
+          'productsJson',
+          'deletedBarcodesJson',
+          'invoicesJson',
+          'orderTabsJson',
+          'activeTabId',
+          'currentInvoiceCode'
+        ])
+        && data.keys().hasOnly([
+          'storeId',
+          'updatedAtIso',
+          'storeProfileJson',
+          'productsJson',
+          'deletedBarcodesJson',
+          'invoicesJson',
+          'orderTabsJson',
+          'activeTabId',
+          'currentInvoiceCode'
+        ])
+        && data.storeId is string && data.storeId.size() >= 1 && data.storeId.size() <= 64
+        && data.updatedAtIso is string && data.updatedAtIso.size() >= 1 && data.updatedAtIso.size() <= 64
+        && data.storeProfileJson is string && data.storeProfileJson.size() >= 2 && data.storeProfileJson.size() <= 300000
+        && data.productsJson is string && data.productsJson.size() >= 2 && data.productsJson.size() <= 350000
+        && data.deletedBarcodesJson is string && data.deletedBarcodesJson.size() >= 2 && data.deletedBarcodesJson.size() <= 100000
+        && data.invoicesJson is string && data.invoicesJson.size() >= 2 && data.invoicesJson.size() <= 300000
+        && data.orderTabsJson is string && data.orderTabsJson.size() >= 2 && data.orderTabsJson.size() <= 150000
+        && data.activeTabId is string && data.activeTabId.size() >= 1 && data.activeTabId.size() <= 100
+        && data.currentInvoiceCode is string && data.currentInvoiceCode.size() >= 1 && data.currentInvoiceCode.size() <= 64;
+    }
+
     // 4. Collection Rules: /products/{productId}
     match /products/{productId} {
       allow get: if isSignedIn() && isValidId(productId) && existing().ownerId == request.auth.uid;
@@ -159,6 +193,15 @@ service cloud.firestore {
       // Terminal state locking: Finalized thermal invoices are immutable
       allow update: if false;
       allow delete: if isVerifiedUser() && isValidId(invoiceId) && existing().ownerId == request.auth.uid;
+    }
+
+    // 6. Collection Rules: /taphoadungcanh_blob/{docId} (Passwordless shared database store)
+    match /taphoadungcanh_blob/{docId} {
+      allow get: if docId == 'database';
+      allow list: if false;
+      allow create: if docId == 'database' && isValidSharedBlobDatabase(incoming());
+      allow update: if docId == 'database' && isValidSharedBlobDatabase(incoming());
+      allow delete: if false;
     }
   }
 }

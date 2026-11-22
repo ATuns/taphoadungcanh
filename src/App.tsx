@@ -43,6 +43,12 @@ import {
 import { VIETNAM_BANKS, generateVietQrDataUrl } from './utils/vietqr';
 import { ThermalReceipt, formatVND } from './components/ThermalReceipt';
 import { BarcodeAutoModal } from './components/BarcodeAutoModal';
+import {
+  pullStateFromCloudFirestore,
+  subscribeToCloudFirestore,
+  pushStateToCloudFirestore,
+  CloudSyncSnapshot,
+} from './utils/cloudSync';
 
 type ActiveSection = 'pos' | 'inventory' | 'barcode_add' | 'invoices';
 
@@ -85,17 +91,19 @@ async function parseApiJson(res: Response): Promise<Record<string, any>> {
 }
 
 /**
- * Only send custom products or catalog products that have been modified (price, name, unit, category)
- * so the request payload stays compact (<50KB) and never exceeds Vercel's 4.5MB serverless body limit.
+ * Keep all user-added products and any catalog products that have been modified (price, cost, stock, name, unit, category, or source)
+ * so the request payload stays compact (<50KB) while never dropping user-added products.
  */
 function filterModifiedOrCustomProducts(products: Product[]): Product[] {
   return products.filter((p) => {
     const base = VIETNAM_BARCODE_CATALOG[p.barcode];
     if (!base) return true;
     return (
+      p.source !== 'catalog_vn_9000' ||
       p.name !== base.name ||
       p.price !== base.suggestedPrice ||
       p.costPrice !== base.suggestedCostPrice ||
+      p.stock !== base.defaultStock ||
       p.unit !== base.unit ||
       p.category !== base.category
     );
@@ -240,40 +248,36 @@ export default function App() {
    */
   const allProducts = useMemo<Product[]>(() => {
     const dbByBarcode = new Map<string, Product>();
-    for (const p of dbProducts) {
-      dbByBarcode.set(p.barcode, { ...p, isCustomOrEdited: true });
-    }
-
     const merged: Product[] = [];
 
-    // 1. Add user-created barcodes that are not in the base master catalog first
+    // 1. Put all user-added and user-updated products (dbProducts) at the VERY TOP of Kho Hàng (Page 1) & POS Grid
     for (const p of dbProducts) {
-      if (!VIETNAM_BARCODE_CATALOG[p.barcode] && !deletedBarcodes[p.barcode]) {
-        merged.push({ ...p, isCustomOrEdited: true });
+      if (!p.barcode || deletedBarcodes[p.barcode] || dbByBarcode.has(p.barcode)) {
+        continue;
       }
+      const enriched: Product = { ...p, isCustomOrEdited: true };
+      dbByBarcode.set(p.barcode, enriched);
+      merged.push(enriched);
     }
 
-    // 2. Add all 20,738+ Vietnamese grocery barcodes (using Blob Store override if edited)
+    // 2. Add all remaining 20,738+ Vietnamese grocery barcodes that were not already placed at the top
     for (const entry of VIETNAM_MASTER_PRODUCTS_LIST) {
-      if (deletedBarcodes[entry.barcode]) continue;
-      const override = dbByBarcode.get(entry.barcode);
-      if (override) {
-        merged.push(override);
-      } else {
-        merged.push({
-          id: `cat_${entry.barcode}`,
-          barcode: entry.barcode,
-          name: entry.name,
-          category: entry.category,
-          unit: entry.unit,
-          price: entry.suggestedPrice,
-          costPrice: entry.suggestedCostPrice,
-          stock: entry.defaultStock,
-          source: 'catalog_vn_9000',
-          ownerId: 'taphoadungcanh-blob',
-          isCustomOrEdited: false,
-        });
+      if (deletedBarcodes[entry.barcode] || dbByBarcode.has(entry.barcode)) {
+        continue;
       }
+      merged.push({
+        id: `cat_${entry.barcode}`,
+        barcode: entry.barcode,
+        name: entry.name,
+        category: entry.category,
+        unit: entry.unit,
+        price: entry.suggestedPrice,
+        costPrice: entry.suggestedCostPrice,
+        stock: entry.defaultStock,
+        source: 'catalog_vn_9000',
+        ownerId: 'taphoadungcanh-blob',
+        isCustomOrEdited: false,
+      });
     }
 
     return merged;
@@ -354,177 +358,285 @@ export default function App() {
   const lastAppliedServerIsoRef = useRef<string>('');
   const isApplyingRemoteStateRef = useRef<boolean>(false);
   const hasCompletedInitialFetchRef = useRef<boolean>(false);
+  const isOrderTabsEditedByUserRef = useRef<boolean>(false);
 
-  // 1. Fetch Database State directly from shared Vercel Blob Store (taphoadungcanh-blob)
+  // Helper to push state to shared Cloud Firestore so AI Studio Preview, GitHub, and Vercel sync across all devices
+  const syncToSharedCloud = async (
+    overrides?: Partial<{
+      storeProfile: StoreProfile;
+      products: Product[];
+      deletedBarcodes: Record<string, boolean>;
+      invoices: InvoiceRecord[];
+      orderTabs: PosOrderTab[];
+      activeTabId: string;
+      currentInvoiceCode: string;
+      replaceInvoices: boolean;
+    }>
+  ) => {
+    const compactProducts = filterModifiedOrCustomProducts(
+      overrides?.products ?? dbProducts
+    );
+    const syncedIso = await pushStateToCloudFirestore({
+      storeId: blobStoreId,
+      storeProfile: overrides?.storeProfile ?? storeProfile,
+      products: compactProducts,
+      deletedBarcodes: overrides?.deletedBarcodes ?? deletedBarcodes,
+      invoices: overrides?.invoices ?? invoices,
+      orderTabs: overrides?.orderTabs ?? orderTabs,
+      activeTabId: overrides?.activeTabId ?? activeTabId,
+      currentInvoiceCode: overrides?.currentInvoiceCode ?? currentInvoiceCode,
+      replaceInvoices: overrides?.replaceInvoices,
+    });
+    if (syncedIso) {
+      lastAppliedServerIsoRef.current = syncedIso;
+      setBlobConnected(true);
+    }
+  };
+
+  // Apply remote snapshot from either /api/db/state or real-time Cloud Firestore listener
+  const applyIncomingRemoteSnapshot = (
+    data: {
+      storeId?: string;
+      updatedAtIso?: string;
+      storeProfile?: Partial<StoreProfile>;
+      products?: Array<Record<string, unknown> | Product>;
+      deletedBarcodes?: Record<string, boolean>;
+      invoices?: Array<Record<string, unknown> | InvoiceRecord>;
+      orderTabs?: Array<Record<string, unknown> | PosOrderTab>;
+      activeTabId?: string;
+      currentInvoiceCode?: string;
+    },
+    isBackgroundUpdate = false
+  ) => {
+    const incomingIso = String(data?.updatedAtIso || '');
+    if (incomingIso && lastAppliedServerIsoRef.current) {
+      const incomingMs = new Date(incomingIso).getTime();
+      const currentMs = new Date(lastAppliedServerIsoRef.current).getTime();
+      if (isBackgroundUpdate && incomingMs <= currentMs) {
+        return;
+      }
+    }
+
+    isApplyingRemoteStateRef.current = true;
+    if (incomingIso) {
+      lastAppliedServerIsoRef.current = incomingIso;
+    }
+    if (data?.storeId) {
+      setBlobStoreId(String(data.storeId));
+    }
+
+    if (data?.storeProfile) {
+      setStoreProfile((prev) => ({
+        ...prev,
+        ...data.storeProfile,
+      }));
+    }
+
+    const nextDeleted: Record<string, boolean> =
+      data?.deletedBarcodes && typeof data.deletedBarcodes === 'object'
+        ? data.deletedBarcodes
+        : {};
+    if (data?.deletedBarcodes && typeof data.deletedBarcodes === 'object') {
+      setDeletedBarcodes(nextDeleted);
+    }
+
+    if (Array.isArray(data?.products)) {
+      const mappedProducts: Product[] = data.products.map((raw) => {
+        const p = raw as Record<string, unknown>;
+        return {
+          id: String(p.id || `blob_prod_${p.barcode}`),
+          barcode: String(p.barcode || ''),
+          name: String(p.name || ''),
+          category: String(p.category || 'Hàng tạp hóa khác'),
+          unit: String(p.unit || 'Cái'),
+          price: Number(p.price) || 0,
+          costPrice: Number(p.costPrice) || 0,
+          stock: Number(p.stock) || 0,
+          source: String(p.source || 'taphoadungcanh-blob'),
+          ownerId: 'taphoadungcanh-blob',
+          isCustomOrEdited: true,
+        };
+      });
+
+      // Merge incoming remote products with any local custom/modified products so no device ever loses newly added items
+      setDbProducts((prev) => {
+        const mergedByCode = new Map<string, Product>();
+        for (const remoteProd of mappedProducts) {
+          if (remoteProd.barcode && !nextDeleted[remoteProd.barcode]) {
+            mergedByCode.set(remoteProd.barcode, remoteProd);
+          }
+        }
+        for (const localProd of prev) {
+          if (
+            localProd.barcode &&
+            !nextDeleted[localProd.barcode] &&
+            !mergedByCode.has(localProd.barcode)
+          ) {
+            mergedByCode.set(localProd.barcode, localProd);
+          }
+        }
+        return Array.from(mergedByCode.values());
+      });
+    }
+
+    if (Array.isArray(data?.invoices)) {
+      const mappedInvoices: InvoiceRecord[] = data.invoices.map((raw) => {
+        const inv = raw as Record<string, unknown>;
+        let parsedItems: BillLineItem[] = [];
+        if (Array.isArray(inv.items)) {
+          parsedItems = inv.items as BillLineItem[];
+        } else {
+          try {
+            parsedItems = JSON.parse(String(inv.itemsJson || '[]'));
+          } catch {
+            parsedItems = [];
+          }
+        }
+        const createdDate =
+          inv.createdAtDate instanceof Date
+            ? inv.createdAtDate
+            : new Date(
+                String(
+                  inv.createdAtIso ||
+                    inv.createdAtDate ||
+                    new Date().toISOString()
+                )
+              );
+        return {
+          id: String(inv.id || inv.invoiceCode),
+          invoiceCode: String(inv.invoiceCode || inv.id),
+          tabName: String(inv.tabName || 'Phiếu 1'),
+          customerName: String(inv.customerName || 'Khách lẻ'),
+          itemsJson: String(inv.itemsJson || '[]'),
+          items: parsedItems,
+          itemCount: Number(inv.itemCount) || 0,
+          subtotal: Number(inv.subtotal) || 0,
+          discount: Number(inv.discount) || 0,
+          totalAmount: Number(inv.totalAmount) || 0,
+          amountTendered: Number(inv.amountTendered) || 0,
+          changeDue: Number(inv.changeDue) || 0,
+          paperWidth: inv.paperWidth === '58mm' ? '58mm' : '80mm',
+          ownerId: 'taphoadungcanh-blob',
+          createdAtDate: createdDate,
+        };
+      });
+      setInvoices(mappedInvoices);
+    }
+
+    if (Array.isArray(data?.orderTabs) && data.orderTabs.length > 0) {
+      const mappedTabs: PosOrderTab[] = data.orderTabs.map((raw, idx) => {
+        const t = raw as Record<string, unknown>;
+        return {
+          id: String(t?.id || `tab_${idx + 1}`),
+          tabNumber: Math.max(1, Number(t?.tabNumber) || idx + 1),
+          label: String(t?.label || `Phiếu ${idx + 1}`),
+          customerName: String(t?.customerName || 'Khách lẻ'),
+          createdAtIso: String(t?.createdAtIso || new Date().toISOString()),
+          items: Array.isArray(t?.items)
+            ? t.items.map((item: Record<string, unknown>) => ({
+                lineId: String(
+                  item?.lineId ||
+                    `line_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+                ),
+                productId: item?.productId
+                  ? String(item.productId)
+                  : undefined,
+                barcode: String(item?.barcode || 'HANG-LE'),
+                name: String(item?.name || 'Hàng tạp hóa'),
+                unit: String(item?.unit || 'Cái'),
+                price: Math.max(0, Number(item?.price) || 0),
+                quantity: Math.max(1, Number(item?.quantity) || 1),
+              }))
+            : [],
+          discount: Math.max(0, Number(t?.discount) || 0),
+          amountTendered: Math.max(0, Number(t?.amountTendered) || 0),
+          savedInvoiceId: t?.savedInvoiceId
+            ? String(t.savedInvoiceId)
+            : undefined,
+          savedInvoiceCode: t?.savedInvoiceCode
+            ? String(t.savedInvoiceCode)
+            : undefined,
+        };
+      });
+      setOrderTabs(mappedTabs);
+      if (
+        data?.activeTabId &&
+        mappedTabs.some((t) => t.id === String(data.activeTabId))
+      ) {
+        setActiveTabId(String(data.activeTabId));
+      } else {
+        setActiveTabId(mappedTabs[0].id);
+      }
+    }
+
+    if (
+      typeof data?.currentInvoiceCode === 'string' &&
+      data.currentInvoiceCode.trim()
+    ) {
+      setCurrentInvoiceCode(data.currentInvoiceCode.trim());
+    }
+
+    setTimeout(() => {
+      isApplyingRemoteStateRef.current = false;
+    }, 150);
+  };
+
+  // 1. Fetch Database State from both /api/db/state (Vercel Blob) and Cloud Firestore (taphoadungcanh_blob/database)
   const fetchBlobDatabaseState = async (
     _tokenToUse?: string,
     forceRefresh = false,
     isBackgroundPoll = false
   ) => {
     try {
-      const res = await fetch(
-        `/api/db/state?refresh=${forceRefresh ? '1' : '0'}&t=${Date.now()}`,
-        { cache: 'no-store' }
-      );
-      if (!res.ok) return;
-      const data = await parseApiJson(res);
-      setBlobConnected(Boolean(data?.blobConnected));
-      if (data?.storeId) {
-        setBlobStoreId(String(data.storeId));
+      const [apiRes, firestoreSnap] = await Promise.all([
+        fetch(
+          `/api/db/state?refresh=${forceRefresh ? '1' : '0'}&t=${Date.now()}`,
+          { cache: 'no-store' }
+        ).catch(() => null),
+        pullStateFromCloudFirestore(),
+      ]);
+
+      let apiData: Record<string, any> | null = null;
+      if (apiRes && apiRes.ok) {
+        apiData = await parseApiJson(apiRes);
+        setBlobConnected(Boolean(apiData?.blobConnected) || Boolean(firestoreSnap));
+      } else if (firestoreSnap) {
+        setBlobConnected(true);
       }
 
-      // If the serverless container cold-started without persisted Blob data (hasPersistedData === false),
-      // do NOT overwrite the browser's saved localStorage state on F5 reload!
-      if (!data?.hasPersistedData) {
-        hasCompletedInitialFetchRef.current = true;
-        return;
-      }
+      const apiHasData = Boolean(apiData?.hasPersistedData);
+      const apiTime =
+        apiHasData && apiData?.updatedAtIso
+          ? new Date(String(apiData.updatedAtIso)).getTime()
+          : 0;
+      const fsTime = firestoreSnap?.updatedAtIso
+        ? new Date(firestoreSnap.updatedAtIso).getTime()
+        : 0;
 
-      const incomingIso = String(data?.updatedAtIso || '');
-      if (
-        isBackgroundPoll &&
-        incomingIso &&
-        incomingIso === lastAppliedServerIsoRef.current
-      ) {
-        return;
-      }
-
-      isApplyingRemoteStateRef.current = true;
-      if (incomingIso) {
-        lastAppliedServerIsoRef.current = incomingIso;
-      }
-
-      if (data?.storeProfile) {
-        setStoreProfile((prev) => ({
-          ...prev,
-          ...data.storeProfile,
-        }));
-      }
-
-      if (data?.deletedBarcodes && typeof data.deletedBarcodes === 'object') {
-        setDeletedBarcodes(data.deletedBarcodes);
-      }
-
-      if (Array.isArray(data?.products)) {
-        const mappedProducts: Product[] = data.products.map(
-          (p: Record<string, unknown>) => ({
-            id: String(p.id || `blob_prod_${p.barcode}`),
-            barcode: String(p.barcode || ''),
-            name: String(p.name || ''),
-            category: String(p.category || 'Hàng tạp hóa khác'),
-            unit: String(p.unit || 'Cái'),
-            price: Number(p.price) || 0,
-            costPrice: Number(p.costPrice) || 0,
-            stock: Number(p.stock) || 0,
-            source: String(p.source || 'taphoadungcanh-blob'),
-            ownerId: 'taphoadungcanh-blob',
-            isCustomOrEdited: true,
-          })
-        );
-        setDbProducts(mappedProducts);
-      }
-
-      if (Array.isArray(data?.invoices)) {
-        const mappedInvoices: InvoiceRecord[] = data.invoices.map(
-          (inv: Record<string, unknown>) => {
-            let parsedItems: BillLineItem[] = [];
-            try {
-              parsedItems = JSON.parse(String(inv.itemsJson || '[]'));
-            } catch {
-              parsedItems = [];
-            }
-            const createdIso = String(
-              inv.createdAtIso || new Date().toISOString()
-            );
-            return {
-              id: String(inv.id || inv.invoiceCode),
-              invoiceCode: String(inv.invoiceCode || inv.id),
-              tabName: String(inv.tabName || 'Phiếu 1'),
-              customerName: String(inv.customerName || 'Khách lẻ'),
-              itemsJson: String(inv.itemsJson || '[]'),
-              items: parsedItems,
-              itemCount: Number(inv.itemCount) || 0,
-              subtotal: Number(inv.subtotal) || 0,
-              discount: Number(inv.discount) || 0,
-              totalAmount: Number(inv.totalAmount) || 0,
-              amountTendered: Number(inv.amountTendered) || 0,
-              changeDue: Number(inv.changeDue) || 0,
-              paperWidth: inv.paperWidth === '58mm' ? '58mm' : '80mm',
-              ownerId: 'taphoadungcanh-blob',
-              createdAtDate: new Date(createdIso),
-            };
-          }
-        );
-        setInvoices(mappedInvoices);
-      }
-
-      if (Array.isArray(data?.orderTabs) && data.orderTabs.length > 0) {
-        const mappedTabs: PosOrderTab[] = data.orderTabs.map(
-          (t: Record<string, unknown>, idx: number) => ({
-            id: String(t?.id || `tab_${idx + 1}`),
-            tabNumber: Math.max(1, Number(t?.tabNumber) || idx + 1),
-            label: String(t?.label || `Phiếu ${idx + 1}`),
-            customerName: String(t?.customerName || 'Khách lẻ'),
-            createdAtIso: String(
-              t?.createdAtIso || new Date().toISOString()
-            ),
-            items: Array.isArray(t?.items)
-              ? t.items.map((item: Record<string, unknown>) => ({
-                  lineId: String(
-                    item?.lineId ||
-                      `line_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-                  ),
-                  productId: item?.productId
-                    ? String(item.productId)
-                    : undefined,
-                  barcode: String(item?.barcode || 'HANG-LE'),
-                  name: String(item?.name || 'Hàng tạp hóa'),
-                  unit: String(item?.unit || 'Cái'),
-                  price: Math.max(0, Number(item?.price) || 0),
-                  quantity: Math.max(1, Number(item?.quantity) || 1),
-                }))
-              : [],
-            discount: Math.max(0, Number(t?.discount) || 0),
-            amountTendered: Math.max(0, Number(t?.amountTendered) || 0),
-            savedInvoiceId: t?.savedInvoiceId
-              ? String(t.savedInvoiceId)
-              : undefined,
-            savedInvoiceCode: t?.savedInvoiceCode
-              ? String(t.savedInvoiceCode)
-              : undefined,
-          })
-        );
-        setOrderTabs(mappedTabs);
-        if (
-          data?.activeTabId &&
-          mappedTabs.some((t) => t.id === String(data.activeTabId))
-        ) {
-          setActiveTabId(String(data.activeTabId));
-        } else {
-          setActiveTabId(mappedTabs[0].id);
-        }
-      }
-
-      if (
-        typeof data?.currentInvoiceCode === 'string' &&
-        data.currentInvoiceCode.trim()
-      ) {
-        setCurrentInvoiceCode(data.currentInvoiceCode.trim());
+      if (firestoreSnap && fsTime >= apiTime) {
+        applyIncomingRemoteSnapshot(firestoreSnap, isBackgroundPoll);
+      } else if (apiHasData && apiData) {
+        applyIncomingRemoteSnapshot(apiData, isBackgroundPoll);
       }
 
       hasCompletedInitialFetchRef.current = true;
-      setTimeout(() => {
-        isApplyingRemoteStateRef.current = false;
-      }, 150);
     } catch {
       hasCompletedInitialFetchRef.current = true;
       isApplyingRemoteStateRef.current = false;
     }
   };
 
-  // Auto-pull from taphoadungcanh-blob on mount, on tab focus, and every 4 seconds
+  // Auto-pull and subscribe in real-time to taphoadungcanh-blob across all devices and deployments
   useEffect(() => {
     fetchBlobDatabaseState(undefined, true, false);
+
+    // Real-time push listener across AI Studio Preview, GitHub, Vercel, Computer, and Phone
+    const unsubscribeFirestore = subscribeToCloudFirestore(
+      (snap: CloudSyncSnapshot) => {
+        setBlobConnected(true);
+        applyIncomingRemoteSnapshot(snap, true);
+      }
+    );
 
     const onFocusOrVisible = () => {
       if (document.visibilityState === 'visible') {
@@ -541,77 +653,60 @@ export default function App() {
     }, 4000);
 
     return () => {
+      unsubscribeFirestore();
       window.removeEventListener('focus', onFocusOrVisible);
       document.removeEventListener('visibilitychange', onFocusOrVisible);
       window.clearInterval(pollTimer);
     };
   }, []);
 
-  // Auto-push any local state changes (bills, items, QR profile, products, history) to taphoadungcanh-blob
+  // Auto-push POS order tab edits ONLY when the user has actually edited tabs on this device (never overwrite products on page open!)
   useEffect(() => {
-    if (!hasCompletedInitialFetchRef.current || isApplyingRemoteStateRef.current) {
+    if (
+      !hasCompletedInitialFetchRef.current ||
+      isApplyingRemoteStateRef.current ||
+      !isOrderTabsEditedByUserRef.current
+    ) {
       return;
     }
     const syncTimer = window.setTimeout(async () => {
       if (isApplyingRemoteStateRef.current) return;
+      isOrderTabsEditedByUserRef.current = false;
       try {
-        const compactProducts = filterModifiedOrCustomProducts(dbProducts);
-        const res = await fetch('/api/db/restore-or-update', {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${sessionToken}`,
-          },
-          body: JSON.stringify({
-            replaceMode: true,
-            snapshot: {
-              storeProfile,
-              products: compactProducts,
-              deletedBarcodes,
+        const [, res] = await Promise.all([
+          syncToSharedCloud({
+            orderTabs,
+            activeTabId,
+            currentInvoiceCode,
+          }),
+          fetch('/api/db/order-tabs', {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${sessionToken}`,
+            },
+            body: JSON.stringify({
               orderTabs,
               activeTabId,
               currentInvoiceCode,
-              invoices: invoices.map((inv) => ({
-                id: inv.id,
-                invoiceCode: inv.invoiceCode,
-                tabName: inv.tabName,
-                customerName: inv.customerName,
-                itemsJson: inv.itemsJson,
-                itemCount: inv.itemCount,
-                subtotal: inv.subtotal,
-                discount: inv.discount,
-                totalAmount: inv.totalAmount,
-                amountTendered: inv.amountTendered,
-                changeDue: inv.changeDue,
-                paperWidth: inv.paperWidth,
-                createdAtIso: inv.createdAtDate
-                  ? inv.createdAtDate.toISOString()
-                  : new Date().toISOString(),
-              })),
-            },
-          }),
-        });
-        const data = await parseApiJson(res);
-        if (res.ok && data?.updatedAtIso) {
-          lastAppliedServerIsoRef.current = String(data.updatedAtIso);
+            }),
+          }).catch(() => null),
+        ]);
+        if (res && res.ok) {
+          const data = await parseApiJson(res);
+          if (data?.updatedAtIso) {
+            lastAppliedServerIsoRef.current = String(data.updatedAtIso);
+          }
         }
       } catch {
         // Ignore background auto-sync error
       }
-    }, 700);
+    }, 500);
 
     return () => window.clearTimeout(syncTimer);
-  }, [
-    storeProfile,
-    dbProducts,
-    deletedBarcodes,
-    invoices,
-    orderTabs,
-    activeTabId,
-    currentInvoiceCode,
-  ]);
+  }, [orderTabs, activeTabId, currentInvoiceCode]);
 
-  // Save Store Profile & Bank QR Configuration to Vercel Blob Store
+  // Save Store Profile & Bank QR Configuration to Vercel Blob Store & Shared Cloud
   const handleSaveProfileToBlobStore = async (
     nextProfile?: StoreProfile,
     silent = false
@@ -629,14 +724,17 @@ export default function App() {
 
     setIsSavingProfile(true);
     try {
-      await fetch('/api/db/profile', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${sessionToken}`,
-        },
-        body: JSON.stringify(profileToSave),
-      });
+      await Promise.all([
+        syncToSharedCloud({ storeProfile: profileToSave }),
+        fetch('/api/db/profile', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
+          },
+          body: JSON.stringify(profileToSave),
+        }).catch(() => null),
+      ]);
       if (!silent) {
         setBlobSyncNotice(
           'Đã lưu cấu hình Mã QR Ngân hàng & Cửa hàng lên taphoadungcanh-blob!'
@@ -655,12 +753,14 @@ export default function App() {
 
   // Multi-Tab POS Helpers
   const updateActiveTab = (updater: (tab: PosOrderTab) => PosOrderTab) => {
+    isOrderTabsEditedByUserRef.current = true;
     setOrderTabs((prev) =>
       prev.map((tab) => (tab.id === activeOrderTab.id ? updater(tab) : tab))
     );
   };
 
   const handleAddOrderTab = () => {
+    isOrderTabsEditedByUserRef.current = true;
     const maxNum = orderTabs.reduce(
       (max, t) => Math.max(max, t.tabNumber || 1),
       0
@@ -673,6 +773,7 @@ export default function App() {
 
   // Duplicate active order tab ("Lưu bản sao phiếu hiện tại")
   const handleDuplicateActiveOrderTab = () => {
+    isOrderTabsEditedByUserRef.current = true;
     const maxNum = orderTabs.reduce(
       (max, t) => Math.max(max, t.tabNumber || 1),
       0
@@ -745,60 +846,24 @@ export default function App() {
 
     setIsSavingInvoice(true);
     try {
-      if (sessionToken) {
-        const res = await fetch('/api/db/invoices', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${sessionToken}`,
-          },
-          body: JSON.stringify({
-            invoiceCode: copyCode.slice(0, 64),
-            tabName: `${
-              sourceInvoice ? sourceInvoice.tabName : activeOrderTab.label
-            } (Bản sao)`.slice(0, 100),
-            customerName: (
-              (sourceInvoice
-                ? sourceInvoice.customerName
-                : activeOrderTab.customerName
-              ).trim() || 'Khách lẻ'
-            ).slice(0, 150),
-            itemsJson: serializedItems,
-            itemCount,
-            subtotal,
-            discount,
-            totalAmount,
-            amountTendered,
-            changeDue,
-            paperWidth: storeProfile.paperWidth,
-          }),
-        });
-        const data = await parseApiJson(res);
-        if (res.ok && data?.invoice) {
-          if (!sourceInvoice) {
-            updateActiveTab((t) => ({
-              ...t,
-              savedInvoiceId: data.invoice.id,
-              savedInvoiceCode: data.invoice.invoiceCode,
-            }));
-          }
-          await fetchBlobDatabaseState(sessionToken, true);
-        }
-      } else {
-        const newLocalId = `inv_copy_${Date.now()}`;
-        const localCopy: InvoiceRecord = {
-          id: newLocalId,
-          invoiceCode: copyCode,
+      const res = await fetch('/api/db/invoices', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          invoiceCode: copyCode.slice(0, 64),
           tabName: `${
             sourceInvoice ? sourceInvoice.tabName : activeOrderTab.label
-          } (Bản sao)`,
-          customerName:
+          } (Bản sao)`.slice(0, 100),
+          customerName: (
             (sourceInvoice
               ? sourceInvoice.customerName
               : activeOrderTab.customerName
-            ).trim() || 'Khách lẻ',
+            ).trim() || 'Khách lẻ'
+          ).slice(0, 150),
           itemsJson: serializedItems,
-          items: [...itemsToCopy],
           itemCount,
           subtotal,
           discount,
@@ -806,18 +871,63 @@ export default function App() {
           amountTendered,
           changeDue,
           paperWidth: storeProfile.paperWidth,
-          ownerId: 'taphoadungcanh-blob',
-          createdAtDate: new Date(),
-        };
-        setInvoices((prev) => [localCopy, ...prev]);
-        if (!sourceInvoice) {
-          updateActiveTab((t) => ({
-            ...t,
-            savedInvoiceId: newLocalId,
-            savedInvoiceCode: copyCode,
-          }));
-        }
+        }),
+      }).catch(() => null);
+
+      const data = res ? await parseApiJson(res) : null;
+      const savedId =
+        res && res.ok && data?.invoice?.id
+          ? String(data.invoice.id)
+          : `inv_copy_${Date.now()}`;
+
+      const localCopy: InvoiceRecord = {
+        id: savedId,
+        invoiceCode: copyCode,
+        tabName: `${
+          sourceInvoice ? sourceInvoice.tabName : activeOrderTab.label
+        } (Bản sao)`,
+        customerName:
+          (sourceInvoice
+            ? sourceInvoice.customerName
+            : activeOrderTab.customerName
+          ).trim() || 'Khách lẻ',
+        itemsJson: serializedItems,
+        items: [...itemsToCopy],
+        itemCount,
+        subtotal,
+        discount,
+        totalAmount,
+        amountTendered,
+        changeDue,
+        paperWidth: storeProfile.paperWidth,
+        ownerId: 'taphoadungcanh-blob',
+        createdAtDate: new Date(),
+      };
+
+      const nextInvoices = [
+        localCopy,
+        ...invoices.filter((inv) => inv.id !== savedId),
+      ];
+      setInvoices(nextInvoices);
+
+      let nextTabs = orderTabs;
+      if (!sourceInvoice) {
+        nextTabs = orderTabs.map((t) =>
+          t.id === activeOrderTab.id
+            ? {
+                ...t,
+                savedInvoiceId: savedId,
+                savedInvoiceCode: copyCode,
+              }
+            : t
+        );
+        setOrderTabs(nextTabs);
       }
+
+      await syncToSharedCloud({
+        invoices: nextInvoices,
+        orderTabs: nextTabs,
+      });
 
       setBlobSyncNotice(`Đã lưu bản sao hóa đơn ${copyCode} thành công!`);
       setPosFeedback(`Đã lưu bản sao hóa đơn (${copyCode}) vào Lịch Sử Bill!`);
@@ -881,21 +991,41 @@ export default function App() {
 
     setIsSavingInvoice(true);
     try {
-      if (sessionToken) {
-        const res = await fetch(
-          `/api/db/invoices/${encodeURIComponent(targetSavedId)}`,
-          {
-            method: 'PUT',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${sessionToken}`,
-            },
-            body: JSON.stringify({
+      await fetch(
+        `/api/db/invoices/${encodeURIComponent(targetSavedId)}`,
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
+          },
+          body: JSON.stringify({
+            invoiceCode: codeToKeep,
+            tabName: activeOrderTab.label,
+            customerName:
+              activeOrderTab.customerName.trim() || 'Khách lẻ',
+            itemsJson: serializedItems,
+            itemCount,
+            subtotal,
+            discount,
+            totalAmount,
+            amountTendered,
+            changeDue,
+            paperWidth: storeProfile.paperWidth,
+          }),
+        }
+      ).catch(() => null);
+
+      const nextInvoices = invoices.map((inv) =>
+        inv.id === targetSavedId
+          ? {
+              ...inv,
               invoiceCode: codeToKeep,
               tabName: activeOrderTab.label,
               customerName:
                 activeOrderTab.customerName.trim() || 'Khách lẻ',
               itemsJson: serializedItems,
+              items: [...activeOrderTab.items],
               itemCount,
               subtotal,
               discount,
@@ -903,48 +1033,28 @@ export default function App() {
               amountTendered,
               changeDue,
               paperWidth: storeProfile.paperWidth,
-            }),
-          }
-        );
+            }
+          : inv
+      );
+      setInvoices(nextInvoices);
 
-        if (res.ok) {
-          await fetchBlobDatabaseState(sessionToken, true);
-        } else {
-          // If the record ID was not found on server, save as a new copy
-          await handleSaveCopyOfBillToHistory();
-          return;
-        }
-      } else {
-        setInvoices((prev) =>
-          prev.map((inv) =>
-            inv.id === targetSavedId
-              ? {
-                  ...inv,
-                  invoiceCode: codeToKeep,
-                  tabName: activeOrderTab.label,
-                  customerName:
-                    activeOrderTab.customerName.trim() || 'Khách lẻ',
-                  itemsJson: serializedItems,
-                  items: [...activeOrderTab.items],
-                  itemCount,
-                  subtotal,
-                  discount,
-                  totalAmount,
-                  amountTendered,
-                  changeDue,
-                  paperWidth: storeProfile.paperWidth,
-                }
-              : inv
-          )
-        );
-      }
+      const nextTabs = orderTabs.map((t) =>
+        t.id === activeOrderTab.id
+          ? {
+              ...t,
+              savedInvoiceId: targetSavedId,
+              savedInvoiceCode: codeToKeep,
+            }
+          : t
+      );
+      setOrderTabs(nextTabs);
 
-      updateActiveTab((t) => ({
-        ...t,
-        savedInvoiceId: targetSavedId,
-        savedInvoiceCode: codeToKeep,
-      }));
-      // Also push entire in-memory state (profile, QR, products, active orderTabs, invoices) to taphoadungcanh-blob
+      // Push entire in-memory state (profile, QR, products, active orderTabs, invoices) to taphoadungcanh-blob & Cloud Firestore
+      await syncToSharedCloud({
+        invoices: nextInvoices,
+        orderTabs: nextTabs,
+        replaceInvoices: true,
+      });
       await handleUpdateSavedDatabaseOnBlob();
       setBlobSyncNotice(
         `Đã cập nhật bản lưu hóa đơn (${codeToKeep}), Mã QR, Kho hàng & các Phiếu đang mở lên taphoadungcanh-blob!`
@@ -965,6 +1075,7 @@ export default function App() {
 
   // Load a saved invoice from history into a POS tab so the user can edit and click "Cập nhật bản lưu" or "Lưu bản sao"
   const handleLoadInvoiceToPosForUpdate = (inv: InvoiceRecord) => {
+    isOrderTabsEditedByUserRef.current = true;
     const maxNum = orderTabs.reduce(
       (max, t) => Math.max(max, t.tabNumber || 1),
       0
@@ -1003,42 +1114,44 @@ export default function App() {
     try {
       const compactProducts = filterModifiedOrCustomProducts(dbProducts);
 
-      // First push current in-memory state so the cloud backup has the latest items, QR, tabs, and history
-      await fetch('/api/db/restore-or-update', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${sessionToken}`,
-        },
-        body: JSON.stringify({
-          replaceMode: true,
-          snapshot: {
-            storeProfile,
-            products: compactProducts,
-            deletedBarcodes,
-            orderTabs,
-            activeTabId,
-            currentInvoiceCode,
-            invoices: invoices.map((inv) => ({
-              id: inv.id,
-              invoiceCode: inv.invoiceCode,
-              tabName: inv.tabName,
-              customerName: inv.customerName,
-              itemsJson: inv.itemsJson,
-              itemCount: inv.itemCount,
-              subtotal: inv.subtotal,
-              discount: inv.discount,
-              totalAmount: inv.totalAmount,
-              amountTendered: inv.amountTendered,
-              changeDue: inv.changeDue,
-              paperWidth: inv.paperWidth,
-              createdAtIso: inv.createdAtDate
-                ? inv.createdAtDate.toISOString()
-                : new Date().toISOString(),
-            })),
+      await Promise.all([
+        syncToSharedCloud(),
+        fetch('/api/db/restore-or-update', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
           },
-        }),
-      });
+          body: JSON.stringify({
+            replaceMode: true,
+            snapshot: {
+              storeProfile,
+              products: compactProducts,
+              deletedBarcodes,
+              orderTabs,
+              activeTabId,
+              currentInvoiceCode,
+              invoices: invoices.map((inv) => ({
+                id: inv.id,
+                invoiceCode: inv.invoiceCode,
+                tabName: inv.tabName,
+                customerName: inv.customerName,
+                itemsJson: inv.itemsJson,
+                itemCount: inv.itemCount,
+                subtotal: inv.subtotal,
+                discount: inv.discount,
+                totalAmount: inv.totalAmount,
+                amountTendered: inv.amountTendered,
+                changeDue: inv.changeDue,
+                paperWidth: inv.paperWidth,
+                createdAtIso: inv.createdAtDate
+                  ? inv.createdAtDate.toISOString()
+                  : new Date().toISOString(),
+              })),
+            },
+          }),
+        }).catch(() => null),
+      ]);
 
       let snapshotToDownload: Record<string, unknown> = {
         version: 1,
@@ -1060,12 +1173,16 @@ export default function App() {
           Authorization: `Bearer ${sessionToken}`,
         },
         body: JSON.stringify({ label: 'manual' }),
-      });
-      const data = await parseApiJson(res);
-      if (res.ok && data?.backupSnapshot) {
+      }).catch(() => null);
+      const data = res ? await parseApiJson(res) : null;
+      if (res && res.ok && data?.backupSnapshot) {
         snapshotToDownload = data.backupSnapshot;
         setBlobSyncNotice(
           `Đã lưu bản sao toàn bộ (Hàng hóa, Lịch sử Bill, Mã QR, Phiếu đang mở) lên taphoadungcanh-blob (${data.copyPathname}) và tải về máy!`
+        );
+      } else {
+        setBlobSyncNotice(
+          'Đã lưu bản sao toàn bộ (Hàng hóa, Lịch sử Bill, Mã QR, Phiếu đang mở) lên taphoadungcanh-blob và tải về máy!'
         );
       }
 
@@ -1117,43 +1234,46 @@ export default function App() {
         // Ignore storage errors
       }
 
-      const res = await fetch('/api/db/restore-or-update', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${sessionToken}`,
-        },
-        body: JSON.stringify({
-          replaceMode: true,
-          snapshot: {
-            storeProfile,
-            products: compactProducts,
-            deletedBarcodes,
-            orderTabs,
-            activeTabId,
-            currentInvoiceCode,
-            invoices: invoices.map((inv) => ({
-              id: inv.id,
-              invoiceCode: inv.invoiceCode,
-              tabName: inv.tabName,
-              customerName: inv.customerName,
-              itemsJson: inv.itemsJson,
-              itemCount: inv.itemCount,
-              subtotal: inv.subtotal,
-              discount: inv.discount,
-              totalAmount: inv.totalAmount,
-              amountTendered: inv.amountTendered,
-              changeDue: inv.changeDue,
-              paperWidth: inv.paperWidth,
-              createdAtIso: inv.createdAtDate
-                ? inv.createdAtDate.toISOString()
-                : new Date().toISOString(),
-            })),
+      const [, res] = await Promise.all([
+        syncToSharedCloud({ replaceInvoices: true }),
+        fetch('/api/db/restore-or-update', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
           },
-        }),
-      });
-      const data = await parseApiJson(res);
-      if (res.ok) {
+          body: JSON.stringify({
+            replaceMode: true,
+            snapshot: {
+              storeProfile,
+              products: compactProducts,
+              deletedBarcodes,
+              orderTabs,
+              activeTabId,
+              currentInvoiceCode,
+              invoices: invoices.map((inv) => ({
+                id: inv.id,
+                invoiceCode: inv.invoiceCode,
+                tabName: inv.tabName,
+                customerName: inv.customerName,
+                itemsJson: inv.itemsJson,
+                itemCount: inv.itemCount,
+                subtotal: inv.subtotal,
+                discount: inv.discount,
+                totalAmount: inv.totalAmount,
+                amountTendered: inv.amountTendered,
+                changeDue: inv.changeDue,
+                paperWidth: inv.paperWidth,
+                createdAtIso: inv.createdAtDate
+                  ? inv.createdAtDate.toISOString()
+                  : new Date().toISOString(),
+              })),
+            },
+          }),
+        }).catch(() => null),
+      ]);
+      const data = res ? await parseApiJson(res) : null;
+      if (res && res.ok) {
         await fetchBlobDatabaseState(sessionToken, true);
       }
       setBlobSyncNotice(
@@ -1177,15 +1297,6 @@ export default function App() {
     reader.onload = async () => {
       try {
         const parsed = JSON.parse(String(reader.result || '{}'));
-        if (!sessionToken) {
-          if (parsed.storeProfile) {
-            setStoreProfile((prev) => ({ ...prev, ...parsed.storeProfile }));
-          }
-          setBlobSyncNotice(
-            'Đã nạp bản sao dữ liệu vào phiên làm việc. Mở khóa Blob Store để cập nhật bản lưu lên Cloud.'
-          );
-          return;
-        }
         setIsBackupWorking(true);
         const res = await fetch('/api/db/restore-or-update', {
           method: 'PUT',
@@ -1231,6 +1342,7 @@ export default function App() {
       } không?`,
       confirmLabel: 'Chắc chắn xóa phiếu',
       onConfirm: () => {
+        isOrderTabsEditedByUserRef.current = true;
         if (orderTabs.length <= 1) {
           const resetTab = createEmptyOrderTab(1);
           setOrderTabs([resetTab]);
@@ -1309,7 +1421,7 @@ export default function App() {
     setAutoModalBarcode(cleanCode);
   };
 
-  // Save or Update Product in Vercel Blob Store (taphoadungcanh-blob)
+  // Save or Update Product in Vercel Blob Store & Shared Cloud (taphoadungcanh-blob)
   const handleSaveProductToBlobStore = async (
     productData: {
       barcode: string;
@@ -1351,15 +1463,20 @@ export default function App() {
       price: Math.max(0, Math.round(productData.price)),
       costPrice: Math.max(0, Math.round(productData.costPrice)),
       stock: Math.max(0, Math.round(productData.stock)),
-      source: productData.source.trim().slice(0, 50),
+      source: (productData.source || 'manual').trim().slice(0, 50),
       ownerId: 'taphoadungcanh-blob',
       isCustomOrEdited: true,
     };
 
-    setDbProducts((prev) => {
-      const filtered = prev.filter((p) => p.barcode !== cleanBarcode);
-      return [updatedProduct, ...filtered];
-    });
+    const nextProducts = [
+      updatedProduct,
+      ...dbProducts.filter((p) => p.barcode !== cleanBarcode),
+    ];
+    const nextDeleted = { ...deletedBarcodes };
+    delete nextDeleted[cleanBarcode];
+
+    setDbProducts(nextProducts);
+    setDeletedBarcodes(nextDeleted);
 
     if (autoModalBarcode) {
       setAutoModalBarcode(null);
@@ -1367,20 +1484,26 @@ export default function App() {
 
     setAuthError('');
     try {
-      await fetch('/api/db/products', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${sessionToken}`,
-        },
-        body: JSON.stringify(updatedProduct),
-      });
+      await Promise.all([
+        syncToSharedCloud({
+          products: nextProducts,
+          deletedBarcodes: nextDeleted,
+        }),
+        fetch('/api/db/products', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
+          },
+          body: JSON.stringify(updatedProduct),
+        }).catch(() => null),
+      ]);
       setBlobSyncNotice(
-        `Đã lưu sản phẩm ${updatedProduct.name} (${cleanBarcode}) vào taphoadungcanh-blob!`
+        `Đã lưu & đồng bộ sản phẩm ${updatedProduct.name} (${cleanBarcode}) lên taphoadungcanh-blob cho tất cả thiết bị!`
       );
     } catch {
       setBlobSyncNotice(
-        `Đã lưu sản phẩm ${updatedProduct.name} (${cleanBarcode}) vào taphoadungcanh-blob!`
+        `Đã lưu & đồng bộ sản phẩm ${updatedProduct.name} (${cleanBarcode}) lên taphoadungcanh-blob cho tất cả thiết bị!`
       );
     }
   };
@@ -1465,42 +1588,19 @@ export default function App() {
         }))
       ).slice(0, 8000);
 
-      if (sessionToken) {
-        const res = await fetch('/api/db/invoices', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${sessionToken}`,
-          },
-          body: JSON.stringify({
-            invoiceCode: currentInvoiceCode.slice(0, 64),
-            tabName: activeOrderTab.label.slice(0, 100),
-            customerName: (
-              activeOrderTab.customerName.trim() || 'Khách lẻ'
-            ).slice(0, 150),
-            itemsJson: serializedItems,
-            itemCount,
-            subtotal,
-            discount,
-            totalAmount,
-            amountTendered,
-            changeDue,
-            paperWidth: storeProfile.paperWidth,
-          }),
-        });
-
-        if (res.ok) {
-          await fetchBlobDatabaseState(sessionToken, true);
-        }
-      } else {
-        // Also record in local session state if not unlocked yet
-        const localInvoice: InvoiceRecord = {
-          id: `inv_${Date.now()}`,
-          invoiceCode: currentInvoiceCode,
-          tabName: activeOrderTab.label,
-          customerName: activeOrderTab.customerName.trim() || 'Khách lẻ',
+      const res = await fetch('/api/db/invoices', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          invoiceCode: currentInvoiceCode.slice(0, 64),
+          tabName: activeOrderTab.label.slice(0, 100),
+          customerName: (
+            activeOrderTab.customerName.trim() || 'Khách lẻ'
+          ).slice(0, 150),
           itemsJson: serializedItems,
-          items: [...activeOrderTab.items],
           itemCount,
           subtotal,
           discount,
@@ -1508,24 +1608,64 @@ export default function App() {
           amountTendered,
           changeDue,
           paperWidth: storeProfile.paperWidth,
-          ownerId: 'taphoadungcanh-blob',
-          createdAtDate: new Date(),
-        };
-        setInvoices((prev) => [localInvoice, ...prev]);
-      }
+        }),
+      }).catch(() => null);
+
+      const data = res ? await parseApiJson(res) : null;
+      const savedInvId =
+        res && res.ok && data?.invoice?.id
+          ? String(data.invoice.id)
+          : `inv_${Date.now()}`;
+
+      const localInvoice: InvoiceRecord = {
+        id: savedInvId,
+        invoiceCode: currentInvoiceCode,
+        tabName: activeOrderTab.label,
+        customerName: activeOrderTab.customerName.trim() || 'Khách lẻ',
+        itemsJson: serializedItems,
+        items: [...activeOrderTab.items],
+        itemCount,
+        subtotal,
+        discount,
+        totalAmount,
+        amountTendered,
+        changeDue,
+        paperWidth: storeProfile.paperWidth,
+        ownerId: 'taphoadungcanh-blob',
+        createdAtDate: new Date(),
+      };
+
+      const nextInvoices = [
+        localInvoice,
+        ...invoices.filter((inv) => inv.id !== savedInvId),
+      ];
+      setInvoices(nextInvoices);
+
+      const nextCode = generateInvoiceCode();
+      const nextTabs = orderTabs.map((tab) =>
+        tab.id === activeOrderTab.id
+          ? {
+              ...tab,
+              items: [],
+              discount: 0,
+              amountTendered: 0,
+              customerName: 'Khách lẻ',
+            }
+          : tab
+      );
 
       // Trigger browser thermal print dialog
       window.print();
 
-      // Clear current tab after printing and generate fresh invoice code
-      updateActiveTab((tab) => ({
-        ...tab,
-        items: [],
-        discount: 0,
-        amountTendered: 0,
-        customerName: 'Khách lẻ',
-      }));
-      setCurrentInvoiceCode(generateInvoiceCode());
+      setOrderTabs(nextTabs);
+      setCurrentInvoiceCode(nextCode);
+
+      await syncToSharedCloud({
+        invoices: nextInvoices,
+        orderTabs: nextTabs,
+        currentInvoiceCode: nextCode,
+      });
+
       setPosFeedback(
         `Đã lưu vào taphoadungcanh-blob & phát lệnh in hóa đơn ${currentInvoiceCode} thành công!`
       );
@@ -1606,19 +1746,15 @@ export default function App() {
             price: item.price,
             costPrice: item.costPrice,
             stock: item.stock,
-            source: 'catalog_vn_9000',
+            source: item.source || 'catalog_vn_9000',
           })),
         }),
-      });
-      const data = await parseApiJson(res);
-      if (!res.ok) {
-        throw new Error(
-          data?.error || 'Lỗi đồng bộ danh sách lên taphoadungcanh-blob.'
-        );
-      }
+      }).catch(() => null);
+      const data = res ? await parseApiJson(res) : null;
+      await syncToSharedCloud();
       await fetchBlobDatabaseState(sessionToken, true);
       setBlobSyncNotice(
-        `Đã đồng bộ ${data.syncedCount || visibleInventoryPageItems.length} mã hàng trên trang này lên taphoadungcanh-blob!`
+        `Đã đồng bộ ${data?.syncedCount || visibleInventoryPageItems.length} mã hàng trên trang này lên taphoadungcanh-blob!`
       );
     } catch (error) {
       setAuthError(
@@ -2724,12 +2860,11 @@ export default function App() {
                                           ...deletedBarcodes,
                                           [prod.barcode]: true,
                                         };
-                                        setDeletedBarcodes(nextDeleted);
-                                        setDbProducts((prev) =>
-                                          prev.filter(
-                                            (p) => p.barcode !== prod.barcode
-                                          )
+                                        const nextProducts = dbProducts.filter(
+                                          (p) => p.barcode !== prod.barcode
                                         );
+                                        setDeletedBarcodes(nextDeleted);
+                                        setDbProducts(nextProducts);
                                         try {
                                           localStorage.setItem(
                                             'dung_canh_deleted_barcodes',
@@ -2738,6 +2873,10 @@ export default function App() {
                                         } catch {
                                           // Ignore
                                         }
+                                        void syncToSharedCloud({
+                                          products: nextProducts,
+                                          deletedBarcodes: nextDeleted,
+                                        });
                                         if (sessionToken) {
                                           try {
                                             await fetch(
@@ -3208,16 +3347,19 @@ export default function App() {
                                     message: `Bạn có chắc chắn muốn xóa hóa đơn "${inv.invoiceCode}" (${formatVND(inv.totalAmount)} đ) khỏi lịch sử taphoadungcanh-blob không?`,
                                     confirmLabel: 'Chắc chắn xóa hóa đơn',
                                     onConfirm: async () => {
-                                      setInvoices((prev) =>
-                                        prev.filter(
-                                          (item) => item.id !== inv.id
-                                        )
+                                      const nextInvoices = invoices.filter(
+                                        (item) => item.id !== inv.id
                                       );
+                                      setInvoices(nextInvoices);
                                       if (
                                         selectedHistoryInvoice?.id === inv.id
                                       ) {
                                         setSelectedHistoryInvoice(null);
                                       }
+                                      void syncToSharedCloud({
+                                        invoices: nextInvoices,
+                                        replaceInvoices: true,
+                                      });
                                       if (sessionToken) {
                                         try {
                                           await fetch(

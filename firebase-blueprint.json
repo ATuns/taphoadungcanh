@@ -165,6 +165,78 @@
         "ownerId",
         "createdAt"
       ]
+    },
+    "SharedBlobDatabase": {
+      "title": "SharedBlobDatabase",
+      "description": "Passwordless shared store database snapshot for taphoadungcanh-blob synchronized across all devices and deployments.",
+      "type": "object",
+      "properties": {
+        "storeId": {
+          "type": "string",
+          "description": "Store identifier for taphoadungcanh-blob.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "updatedAtIso": {
+          "type": "string",
+          "description": "ISO timestamp of the latest sync update.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "storeProfileJson": {
+          "type": "string",
+          "description": "Serialized store profile and VietQR settings.",
+          "minLength": 2,
+          "maxLength": 300000
+        },
+        "productsJson": {
+          "type": "string",
+          "description": "Serialized custom or modified products map.",
+          "minLength": 2,
+          "maxLength": 350000
+        },
+        "deletedBarcodesJson": {
+          "type": "string",
+          "description": "Serialized deleted barcodes map.",
+          "minLength": 2,
+          "maxLength": 100000
+        },
+        "invoicesJson": {
+          "type": "string",
+          "description": "Serialized saved and printed thermal invoices.",
+          "minLength": 2,
+          "maxLength": 300000
+        },
+        "orderTabsJson": {
+          "type": "string",
+          "description": "Serialized active POS order tabs.",
+          "minLength": 2,
+          "maxLength": 150000
+        },
+        "activeTabId": {
+          "type": "string",
+          "description": "Currently active POS order tab ID.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "currentInvoiceCode": {
+          "type": "string",
+          "description": "Current receipt invoice code.",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      },
+      "required": [
+        "storeId",
+        "updatedAtIso",
+        "storeProfileJson",
+        "productsJson",
+        "deletedBarcodesJson",
+        "invoicesJson",
+        "orderTabsJson",
+        "activeTabId",
+        "currentInvoiceCode"
+      ]
     }
   },
   "firestore": {
@@ -179,6 +251,12 @@
         "$ref": "#/entities/Invoice"
       },
       "description": "Completed thermal receipt invoices."
+    },
+    "/taphoadungcanh_blob/{docId}": {
+      "schema": {
+        "$ref": "#/entities/SharedBlobDatabase"
+      },
+      "description": "Shared database document for taphoadungcanh-blob across all devices and deployments."
     }
   }
 }
