@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Printer, Edit3, Check, Plus, Minus, Trash2, QrCode } from 'lucide-react';
-import { BillLineItem, StoreProfile } from '../types.ts';
-import { generateVietQrDataUrl } from '../utils/vietqr.ts';
+import { BillLineItem, StoreProfile } from '../types';
+import { generateVietQrDataUrl } from '../utils/vietqr';
 
 interface ThermalReceiptProps {
   invoiceCode: string;

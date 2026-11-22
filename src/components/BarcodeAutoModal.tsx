@@ -5,8 +5,8 @@ import {
   PRODUCT_UNITS,
   VIETNAM_BARCODE_CATALOG,
   GS1_BRAND_PREFIXES,
-} from '../data/vietnamBarcodes.ts';
-import { Product } from '../types.ts';
+} from '../data/vietnamBarcodes';
+import { Product } from '../types';
 
 interface BarcodeAutoModalProps {
   initialBarcode?: string;

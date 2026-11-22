@@ -33,16 +33,16 @@ import {
   PosOrderTab,
   InvoiceRecord,
   StoreProfile,
-} from './types.ts';
+} from './types';
 import {
   VIETNAM_BARCODE_CATALOG,
   VIETNAM_MASTER_PRODUCTS_LIST,
   PRODUCT_CATEGORIES,
   PRODUCT_UNITS,
-} from './data/vietnamBarcodes.ts';
-import { VIETNAM_BANKS, generateVietQrDataUrl } from './utils/vietqr.ts';
-import { ThermalReceipt, formatVND } from './components/ThermalReceipt.tsx';
-import { BarcodeAutoModal } from './components/BarcodeAutoModal.tsx';
+} from './data/vietnamBarcodes';
+import { VIETNAM_BANKS, generateVietQrDataUrl } from './utils/vietqr';
+import { ThermalReceipt, formatVND } from './components/ThermalReceipt';
+import { BarcodeAutoModal } from './components/BarcodeAutoModal';
 
 type ActiveSection = 'pos' | 'inventory' | 'barcode_add' | 'invoices';
 
@@ -66,6 +66,40 @@ function createEmptyOrderTab(tabNumber: number): PosOrderTab {
     discount: 0,
     amountTendered: 0,
   };
+}
+
+/**
+ * Safely parse API JSON responses so non-JSON server errors (e.g. Vercel edge text/html errors)
+ * never throw "Unexpected token 'A', 'A server e'... is not valid JSON".
+ */
+async function parseApiJson(res: Response): Promise<Record<string, any>> {
+  const rawText = await res.text();
+  if (!rawText) return {};
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    return {
+      error: `Máy chủ trả về phản hồi không phải JSON (HTTP ${res.status}): ${rawText.slice(0, 140)}`,
+    };
+  }
+}
+
+/**
+ * Only send custom products or catalog products that have been modified (price, name, unit, category)
+ * so the request payload stays compact (<50KB) and never exceeds Vercel's 4.5MB serverless body limit.
+ */
+function filterModifiedOrCustomProducts(products: Product[]): Product[] {
+  return products.filter((p) => {
+    const base = VIETNAM_BARCODE_CATALOG[p.barcode];
+    if (!base) return true;
+    return (
+      p.name !== base.name ||
+      p.price !== base.suggestedPrice ||
+      p.costPrice !== base.suggestedCostPrice ||
+      p.unit !== base.unit ||
+      p.category !== base.category
+    );
+  });
 }
 
 export default function App() {
@@ -278,7 +312,7 @@ export default function App() {
         `/api/db/state${forceRefresh ? '?refresh=1' : ''}`
       );
       if (!res.ok) return;
-      const data = await res.json();
+      const data = await parseApiJson(res);
       setBlobConnected(Boolean(data?.blobConnected));
       if (data?.storeId) {
         setBlobStoreId(String(data.storeId));
@@ -575,7 +609,7 @@ export default function App() {
             paperWidth: storeProfile.paperWidth,
           }),
         });
-        const data = await res.json();
+        const data = await parseApiJson(res);
         if (res.ok && data?.invoice) {
           if (!sourceInvoice) {
             updateActiveTab((t) => ({
@@ -803,6 +837,8 @@ export default function App() {
   const handleCreateDatabaseBackupCopy = async () => {
     setIsBackupWorking(true);
     try {
+      const compactProducts = filterModifiedOrCustomProducts(dbProducts);
+
       // First push current in-memory state so the cloud backup has the latest items, QR, tabs, and history
       await fetch('/api/db/restore-or-update', {
         method: 'PUT',
@@ -814,7 +850,7 @@ export default function App() {
           replaceMode: true,
           snapshot: {
             storeProfile,
-            products: dbProducts,
+            products: compactProducts,
             deletedBarcodes,
             orderTabs,
             activeTabId,
@@ -845,7 +881,7 @@ export default function App() {
         storeId: blobStoreId,
         updatedAtIso: new Date().toISOString(),
         storeProfile,
-        products: dbProducts,
+        products: compactProducts,
         deletedBarcodes,
         invoices,
         orderTabs,
@@ -861,7 +897,7 @@ export default function App() {
         },
         body: JSON.stringify({ label: 'manual' }),
       });
-      const data = await res.json();
+      const data = await parseApiJson(res);
       if (res.ok && data?.backupSnapshot) {
         snapshotToDownload = data.backupSnapshot;
         setBlobSyncNotice(
@@ -896,6 +932,7 @@ export default function App() {
   const handleUpdateSavedDatabaseOnBlob = async () => {
     setIsBackupWorking(true);
     try {
+      const compactProducts = filterModifiedOrCustomProducts(dbProducts);
       const res = await fetch('/api/db/restore-or-update', {
         method: 'PUT',
         headers: {
@@ -906,7 +943,7 @@ export default function App() {
           replaceMode: true,
           snapshot: {
             storeProfile,
-            products: dbProducts,
+            products: compactProducts,
             deletedBarcodes,
             orderTabs,
             activeTabId,
@@ -931,7 +968,7 @@ export default function App() {
           },
         }),
       });
-      const data = await res.json();
+      const data = await parseApiJson(res);
       if (!res.ok) {
         throw new Error(
           data?.error || 'Không thể cập nhật bản lưu lên taphoadungcanh-blob.'
@@ -979,7 +1016,7 @@ export default function App() {
           },
           body: JSON.stringify({ snapshot: parsed }),
         });
-        const data = await res.json();
+        const data = await parseApiJson(res);
         if (!res.ok) {
           throw new Error(data?.error || 'Tệp bản sao không hợp lệ.');
         }
@@ -1401,7 +1438,7 @@ export default function App() {
           })),
         }),
       });
-      const data = await res.json();
+      const data = await parseApiJson(res);
       if (!res.ok) {
         throw new Error(
           data?.error || 'Lỗi đồng bộ danh sách lên taphoadungcanh-blob.'

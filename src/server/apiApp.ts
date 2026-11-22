@@ -6,7 +6,7 @@ import { put, get, list } from '@vercel/blob';
 import {
   VIETNAM_BARCODE_CATALOG,
   GS1_BRAND_PREFIXES,
-} from '../data/vietnamBarcodes';
+} from '../data/vietnamBarcodes.js';
 
 const BLOB_PATHNAME = 'taphoadungcanh-blob/database.json';
 const LOCAL_FALLBACK_FILE = path.resolve(
@@ -348,12 +348,36 @@ async function loadBlobDatabase(
   return cachedDb;
 }
 
+function pruneUnmodifiedDefaultCatalogDuplicates(
+  products: Record<string, BlobProductRecord>
+): Record<string, BlobProductRecord> {
+  const cleaned: Record<string, BlobProductRecord> = {};
+  for (const [code, prod] of Object.entries(products || {})) {
+    const base = VIETNAM_BARCODE_CATALOG[code];
+    if (
+      base &&
+      prod.source === 'catalog_vn_9000' &&
+      prod.name === base.name &&
+      prod.price === base.suggestedPrice &&
+      prod.costPrice === base.suggestedCostPrice &&
+      prod.unit === base.unit &&
+      prod.category === base.category
+    ) {
+      // Unmodified built-in catalog item is already included in VIETNAM_MASTER_PRODUCTS_LIST
+      continue;
+    }
+    cleaned[code] = prod;
+  }
+  return cleaned;
+}
+
 async function saveBlobDatabase(dbData: TapHoaBlobDatabase): Promise<{
   savedToVercelBlob: boolean;
   blobUrl?: string;
 }> {
   dbData.updatedAtIso = new Date().toISOString();
   dbData.storeId = process.env.BLOB_STORE_ID || 'taphoadungcanh-blob';
+  dbData.products = pruneUnmodifiedDefaultCatalogDuplicates(dbData.products);
   cachedDb = dbData;
   lastBlobFetchMs = Date.now();
 
@@ -546,7 +570,7 @@ async function queryOpenFactsRegistry(
 
 export function createApiRouter() {
   const router = express.Router();
-  router.use(express.json({ limit: '4mb' }));
+  router.use(express.json({ limit: '15mb' }));
 
   // 1. Auth & Blob Store Connection Status
   router.get('/api/auth/status', async (_req, res) => {
