@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import express, { Request, Response, NextFunction } from 'express';
-import { put, list } from '@vercel/blob';
+import { put, get, list } from '@vercel/blob';
 import {
   VIETNAM_BARCODE_CATALOG,
   GS1_BRAND_PREFIXES,
@@ -68,6 +68,30 @@ interface EncryptedAdminCredential {
   ciphertext: string;
 }
 
+export interface BlobOrderTabLineItem {
+  lineId: string;
+  productId?: string;
+  barcode: string;
+  name: string;
+  unit: string;
+  price: number;
+  quantity: number;
+  note?: string;
+}
+
+export interface BlobPosOrderTab {
+  id: string;
+  tabNumber: number;
+  label: string;
+  customerName: string;
+  createdAtIso: string;
+  items: BlobOrderTabLineItem[];
+  discount: number;
+  amountTendered: number;
+  savedInvoiceId?: string;
+  savedInvoiceCode?: string;
+}
+
 export interface TapHoaBlobDatabase {
   version: number;
   storeId: string;
@@ -77,6 +101,9 @@ export interface TapHoaBlobDatabase {
   products: Record<string, BlobProductRecord>;
   deletedBarcodes: Record<string, boolean>;
   invoices: BlobInvoiceRecord[];
+  orderTabs?: BlobPosOrderTab[];
+  activeTabId?: string;
+  currentInvoiceCode?: string;
 }
 
 const DEFAULT_STORE_PROFILE: BlobStoreProfile = {
@@ -103,6 +130,9 @@ function createEmptyDatabase(): TapHoaBlobDatabase {
     products: {},
     deletedBarcodes: {},
     invoices: [],
+    orderTabs: [],
+    activeTabId: '',
+    currentInvoiceCode: '',
   };
 }
 
@@ -165,7 +195,51 @@ function getBlobToken(): string {
   return token;
 }
 
-async function loadBlobDatabase(forceRefresh = false): Promise<TapHoaBlobDatabase> {
+async function readStreamToString(
+  stream: ReadableStream<Uint8Array>
+): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) chunks.push(value);
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8');
+}
+
+async function putBlobWithPrivateFirst(
+  pathname: string,
+  body: string,
+  token: string
+) {
+  try {
+    return await put(pathname, body, {
+      access: 'private',
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      contentType: 'application/json',
+      token,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Fallback if store is configured as public-only
+    if (msg.toLowerCase().includes('public')) {
+      return await put(pathname, body, {
+        access: 'public',
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        contentType: 'application/json',
+        token,
+      });
+    }
+    throw err;
+  }
+}
+
+async function loadBlobDatabase(
+  forceRefresh = false
+): Promise<TapHoaBlobDatabase> {
   const token = getBlobToken();
   const now = Date.now();
 
@@ -173,49 +247,76 @@ async function loadBlobDatabase(forceRefresh = false): Promise<TapHoaBlobDatabas
     return cachedDb;
   }
 
-  // 1. Try reading from Vercel Blob Store (taphoadungcanh-blob/database.json) if token is set
+  // 1. Try reading from Private Vercel Blob Store (taphoadungcanh-blob/database.json) via get(..., { access: 'private' })
   if (token) {
     try {
-      const { blobs } = await list({
-        prefix: BLOB_PATHNAME,
-        token,
-        limit: 5,
-      });
+      let rawText: string | null = null;
 
-      if (blobs && blobs.length > 0) {
-        const sorted = [...blobs].sort(
-          (a, b) =>
-            new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
-        );
-        const latestBlob = sorted[0];
-        const targetUrl = `${latestBlob.url}${
-          latestBlob.url.includes('?') ? '&' : '?'
-        }t=${Date.now()}`;
-        const res = await fetch(targetUrl, {
-          cache: 'no-store',
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
+      try {
+        const privateRes = await get(BLOB_PATHNAME, {
+          access: 'private',
+          useCache: false,
+          token,
         });
-        if (res.ok) {
-          const parsed = (await res.json()) as Partial<TapHoaBlobDatabase>;
-          cachedDb = {
-            ...createEmptyDatabase(),
-            ...parsed,
-            storeProfile: {
-              ...DEFAULT_STORE_PROFILE,
-              ...(parsed.storeProfile || {}),
-            },
-            products: parsed.products || {},
-            deletedBarcodes: parsed.deletedBarcodes || {},
-            invoices: Array.isArray(parsed.invoices) ? parsed.invoices : [],
-          };
-          lastBlobFetchMs = now;
-          return cachedDb;
+        if (
+          privateRes &&
+          privateRes.statusCode === 200 &&
+          privateRes.stream
+        ) {
+          rawText = await readStreamToString(privateRes.stream);
+        }
+      } catch {
+        // Fallback to list + get in case pathname has a suffix or public access
+        const { blobs } = await list({
+          prefix: BLOB_PATHNAME,
+          token,
+          limit: 5,
+        });
+        if (blobs && blobs.length > 0) {
+          const sorted = [...blobs].sort(
+            (a, b) =>
+              new Date(b.uploadedAt).getTime() -
+              new Date(a.uploadedAt).getTime()
+          );
+          const latestBlob = sorted[0];
+          const byUrl = await get(latestBlob.url, {
+            access: 'private',
+            useCache: false,
+            token,
+          }).catch(() =>
+            get(latestBlob.url, {
+              access: 'public',
+              useCache: false,
+              token,
+            })
+          );
+          if (byUrl && byUrl.statusCode === 200 && byUrl.stream) {
+            rawText = await readStreamToString(byUrl.stream);
+          }
         }
       }
+
+      if (rawText) {
+        const parsed = JSON.parse(rawText) as Partial<TapHoaBlobDatabase>;
+        cachedDb = {
+          ...createEmptyDatabase(),
+          ...parsed,
+          storeProfile: {
+            ...DEFAULT_STORE_PROFILE,
+            ...(parsed.storeProfile || {}),
+          },
+          products: parsed.products || {},
+          deletedBarcodes: parsed.deletedBarcodes || {},
+          invoices: Array.isArray(parsed.invoices) ? parsed.invoices : [],
+        };
+        lastBlobFetchMs = now;
+        return cachedDb;
+      }
     } catch (err) {
-      console.error('Vercel Blob read notice:', err instanceof Error ? err.message : err);
+      console.error(
+        'Vercel Blob read notice:',
+        err instanceof Error ? err.message : err
+      );
     }
   }
 
@@ -267,13 +368,11 @@ async function saveBlobDatabase(dbData: TapHoaBlobDatabase): Promise<{
 
   const token = getBlobToken();
   if (token) {
-    const blobResult = await put(BLOB_PATHNAME, serialized, {
-      access: 'public',
-      addRandomSuffix: false,
-      allowOverwrite: true,
-      contentType: 'application/json',
-      token,
-    });
+    const blobResult = await putBlobWithPrivateFirst(
+      BLOB_PATHNAME,
+      serialized,
+      token
+    );
     return {
       savedToVercelBlob: true,
       blobUrl: blobResult.url,
@@ -595,6 +694,9 @@ export function createApiRouter() {
         products: Object.values(dbData.products),
         deletedBarcodes: dbData.deletedBarcodes,
         invoices: dbData.invoices,
+        orderTabs: Array.isArray(dbData.orderTabs) ? dbData.orderTabs : [],
+        activeTabId: dbData.activeTabId || '',
+        currentInvoiceCode: dbData.currentInvoiceCode || '',
       });
     } catch (error) {
       return res.status(500).json({
@@ -938,13 +1040,11 @@ export function createApiRouter() {
       let blobUrl = '';
 
       if (token) {
-        const blobResult = await put(copyPathname, serialized, {
-          access: 'public',
-          addRandomSuffix: false,
-          allowOverwrite: true,
-          contentType: 'application/json',
-          token,
-        });
+        const blobResult = await putBlobWithPrivateFirst(
+          copyPathname,
+          serialized,
+          token
+        );
         blobUrl = blobResult.url;
       }
 
@@ -963,6 +1063,9 @@ export function createApiRouter() {
           products: dbData.products,
           deletedBarcodes: dbData.deletedBarcodes,
           invoices: dbData.invoices,
+          orderTabs: dbData.orderTabs || [],
+          activeTabId: dbData.activeTabId || '',
+          currentInvoiceCode: dbData.currentInvoiceCode || '',
         },
       });
     } catch (error) {
@@ -978,6 +1081,7 @@ export function createApiRouter() {
   router.put('/api/db/restore-or-update', requireAuth, async (req, res) => {
     try {
       const incoming = req.body?.snapshot;
+      const replaceMode = Boolean(req.body?.replaceMode);
       const dbData = await loadBlobDatabase(true);
 
       if (incoming && typeof incoming === 'object') {
@@ -993,6 +1097,9 @@ export function createApiRouter() {
         }
 
         if (incoming.products && typeof incoming.products === 'object') {
+          if (replaceMode) {
+            dbData.products = {};
+          }
           if (Array.isArray(incoming.products)) {
             for (const p of incoming.products) {
               const code = String(p?.barcode || '')
@@ -1047,21 +1154,32 @@ export function createApiRouter() {
           incoming.deletedBarcodes &&
           typeof incoming.deletedBarcodes === 'object'
         ) {
-          dbData.deletedBarcodes = {
-            ...dbData.deletedBarcodes,
-            ...incoming.deletedBarcodes,
-          };
+          dbData.deletedBarcodes = replaceMode
+            ? { ...incoming.deletedBarcodes }
+            : {
+                ...dbData.deletedBarcodes,
+                ...incoming.deletedBarcodes,
+              };
         }
 
         if (Array.isArray(incoming.invoices)) {
-          const existingIds = new Set(dbData.invoices.map((i) => i.id));
-          const mergedInvoices = [...dbData.invoices];
-          for (const rawInv of incoming.invoices) {
+          const normalizedInvoices: BlobInvoiceRecord[] = [];
+          const seenIds = new Set<string>();
+
+          const sourceList = replaceMode
+            ? incoming.invoices
+            : [...incoming.invoices, ...dbData.invoices];
+
+          for (const rawInv of sourceList) {
             if (!rawInv || typeof rawInv !== 'object') continue;
             const invId = String(
-              rawInv.id || `inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+              rawInv.id ||
+                `inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
             );
-            const normalized: BlobInvoiceRecord = {
+            if (seenIds.has(invId)) continue;
+            seenIds.add(invId);
+
+            normalizedInvoices.push({
               id: invId,
               invoiceCode: String(rawInv.invoiceCode || invId).slice(0, 64),
               tabName: String(rawInv.tabName || 'Phiếu 1').slice(0, 100),
@@ -1086,16 +1204,61 @@ export function createApiRouter() {
               createdAtIso: String(
                 rawInv.createdAtIso || new Date().toISOString()
               ),
-            };
-            if (existingIds.has(invId)) {
-              const targetIdx = mergedInvoices.findIndex((i) => i.id === invId);
-              if (targetIdx > -1) mergedInvoices[targetIdx] = normalized;
-            } else {
-              mergedInvoices.push(normalized);
-              existingIds.add(invId);
-            }
+            });
           }
-          dbData.invoices = mergedInvoices.slice(0, 2000);
+          dbData.invoices = normalizedInvoices.slice(0, 2000);
+        }
+
+        // Persist active POS order tabs, activeTabId, and currentInvoiceCode so any device opening the app sees the exact same bills in memory!
+        if (Array.isArray(incoming.orderTabs)) {
+          dbData.orderTabs = incoming.orderTabs
+            .slice(0, 30)
+            .map((t: Record<string, unknown>, idx: number) => ({
+              id: String(t?.id || `tab_${idx + 1}`),
+              tabNumber: Math.max(1, Number(t?.tabNumber) || idx + 1),
+              label: String(t?.label || `Phiếu ${idx + 1}`).slice(0, 80),
+              customerName: String(t?.customerName || 'Khách lẻ').slice(0, 150),
+              createdAtIso: String(
+                t?.createdAtIso || new Date().toISOString()
+              ),
+              items: Array.isArray(t?.items)
+                ? t.items.slice(0, 300).map((item: Record<string, unknown>) => ({
+                    lineId: String(
+                      item?.lineId ||
+                        `line_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+                    ),
+                    productId: item?.productId
+                      ? String(item.productId)
+                      : undefined,
+                    barcode: String(item?.barcode || 'HANG-LE').slice(0, 64),
+                    name: String(item?.name || 'Hàng tạp hóa').slice(0, 200),
+                    unit: String(item?.unit || 'Cái').slice(0, 50),
+                    price: Math.max(0, Math.round(Number(item?.price) || 0)),
+                    quantity: Math.max(
+                      1,
+                      Math.round(Number(item?.quantity) || 1)
+                    ),
+                  }))
+                : [],
+              discount: Math.max(0, Math.round(Number(t?.discount) || 0)),
+              amountTendered: Math.max(
+                0,
+                Math.round(Number(t?.amountTendered) || 0)
+              ),
+              savedInvoiceId: t?.savedInvoiceId
+                ? String(t.savedInvoiceId)
+                : undefined,
+              savedInvoiceCode: t?.savedInvoiceCode
+                ? String(t.savedInvoiceCode)
+                : undefined,
+            }));
+        }
+
+        if (typeof incoming.activeTabId === 'string') {
+          dbData.activeTabId = incoming.activeTabId.slice(0, 100);
+        }
+        if (typeof incoming.currentInvoiceCode === 'string') {
+          dbData.currentInvoiceCode = incoming.currentInvoiceCode.slice(0, 64);
         }
       }
 
@@ -1104,6 +1267,7 @@ export function createApiRouter() {
         updatedAtIso: dbData.updatedAtIso,
         productCount: Object.keys(dbData.products).length,
         invoiceCount: dbData.invoices.length,
+        tabCount: Array.isArray(dbData.orderTabs) ? dbData.orderTabs.length : 0,
         savedToVercelBlob: saveRes.savedToVercelBlob,
       });
     } catch (error) {

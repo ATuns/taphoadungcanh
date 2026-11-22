@@ -347,6 +347,60 @@ export default function App() {
         );
         setInvoices(mappedInvoices);
       }
+
+      if (Array.isArray(data?.orderTabs) && data.orderTabs.length > 0) {
+        const mappedTabs: PosOrderTab[] = data.orderTabs.map(
+          (t: Record<string, unknown>, idx: number) => ({
+            id: String(t?.id || `tab_${idx + 1}`),
+            tabNumber: Math.max(1, Number(t?.tabNumber) || idx + 1),
+            label: String(t?.label || `Phiếu ${idx + 1}`),
+            customerName: String(t?.customerName || 'Khách lẻ'),
+            createdAtIso: String(
+              t?.createdAtIso || new Date().toISOString()
+            ),
+            items: Array.isArray(t?.items)
+              ? t.items.map((item: Record<string, unknown>) => ({
+                  lineId: String(
+                    item?.lineId ||
+                      `line_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+                  ),
+                  productId: item?.productId
+                    ? String(item.productId)
+                    : undefined,
+                  barcode: String(item?.barcode || 'HANG-LE'),
+                  name: String(item?.name || 'Hàng tạp hóa'),
+                  unit: String(item?.unit || 'Cái'),
+                  price: Math.max(0, Number(item?.price) || 0),
+                  quantity: Math.max(1, Number(item?.quantity) || 1),
+                }))
+              : [],
+            discount: Math.max(0, Number(t?.discount) || 0),
+            amountTendered: Math.max(0, Number(t?.amountTendered) || 0),
+            savedInvoiceId: t?.savedInvoiceId
+              ? String(t.savedInvoiceId)
+              : undefined,
+            savedInvoiceCode: t?.savedInvoiceCode
+              ? String(t.savedInvoiceCode)
+              : undefined,
+          })
+        );
+        setOrderTabs(mappedTabs);
+        if (
+          data?.activeTabId &&
+          mappedTabs.some((t) => t.id === String(data.activeTabId))
+        ) {
+          setActiveTabId(String(data.activeTabId));
+        } else {
+          setActiveTabId(mappedTabs[0].id);
+        }
+      }
+
+      if (
+        typeof data?.currentInvoiceCode === 'string' &&
+        data.currentInvoiceCode.trim()
+      ) {
+        setCurrentInvoiceCode(data.currentInvoiceCode.trim());
+      }
     } catch (error) {
       setAuthError(
         error instanceof Error
@@ -692,11 +746,13 @@ export default function App() {
         savedInvoiceId: targetSavedId,
         savedInvoiceCode: codeToKeep,
       }));
+      // Also push entire in-memory state (profile, QR, products, active orderTabs, invoices) to taphoadungcanh-blob
+      await handleUpdateSavedDatabaseOnBlob();
       setBlobSyncNotice(
-        `Đã cập nhật bản lưu hóa đơn ${codeToKeep} trên taphoadungcanh-blob!`
+        `Đã cập nhật bản lưu hóa đơn (${codeToKeep}), Mã QR, Kho hàng & các Phiếu đang mở lên taphoadungcanh-blob!`
       );
       setPosFeedback(
-        `Đã cập nhật bản lưu hóa đơn (${codeToKeep}) thành công!`
+        `Đã cập nhật toàn bộ bản lưu (${codeToKeep}) lên taphoadungcanh-blob để mọi thiết bị mở lên đều giống nhau!`
       );
     } catch (error) {
       setAuthError(
@@ -747,6 +803,43 @@ export default function App() {
   const handleCreateDatabaseBackupCopy = async () => {
     setIsBackupWorking(true);
     try {
+      // First push current in-memory state so the cloud backup has the latest items, QR, tabs, and history
+      await fetch('/api/db/restore-or-update', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          replaceMode: true,
+          snapshot: {
+            storeProfile,
+            products: dbProducts,
+            deletedBarcodes,
+            orderTabs,
+            activeTabId,
+            currentInvoiceCode,
+            invoices: invoices.map((inv) => ({
+              id: inv.id,
+              invoiceCode: inv.invoiceCode,
+              tabName: inv.tabName,
+              customerName: inv.customerName,
+              itemsJson: inv.itemsJson,
+              itemCount: inv.itemCount,
+              subtotal: inv.subtotal,
+              discount: inv.discount,
+              totalAmount: inv.totalAmount,
+              amountTendered: inv.amountTendered,
+              changeDue: inv.changeDue,
+              paperWidth: inv.paperWidth,
+              createdAtIso: inv.createdAtDate
+                ? inv.createdAtDate.toISOString()
+                : new Date().toISOString(),
+            })),
+          },
+        }),
+      });
+
       let snapshotToDownload: Record<string, unknown> = {
         version: 1,
         storeId: blobStoreId,
@@ -755,26 +848,25 @@ export default function App() {
         products: dbProducts,
         deletedBarcodes,
         invoices,
+        orderTabs,
+        activeTabId,
+        currentInvoiceCode,
       };
 
-      if (sessionToken) {
-        const res = await fetch('/api/db/backup-copy', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${sessionToken}`,
-          },
-          body: JSON.stringify({ label: 'manual' }),
-        });
-        const data = await res.json();
-        if (res.ok && data?.backupSnapshot) {
-          snapshotToDownload = data.backupSnapshot;
-          setBlobSyncNotice(
-            `Đã tạo bản sao lưu trên taphoadungcanh-blob (${data.copyPathname}) và tải bản sao về máy!`
-          );
-        }
-      } else {
-        setBlobSyncNotice('Đã tải tệp bản sao dữ liệu (.json) về máy!');
+      const res = await fetch('/api/db/backup-copy', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({ label: 'manual' }),
+      });
+      const data = await res.json();
+      if (res.ok && data?.backupSnapshot) {
+        snapshotToDownload = data.backupSnapshot;
+        setBlobSyncNotice(
+          `Đã lưu bản sao toàn bộ (Hàng hóa, Lịch sử Bill, Mã QR, Phiếu đang mở) lên taphoadungcanh-blob (${data.copyPathname}) và tải về máy!`
+        );
       }
 
       // Trigger JSON backup download to user's computer
@@ -811,10 +903,14 @@ export default function App() {
           Authorization: `Bearer ${sessionToken}`,
         },
         body: JSON.stringify({
+          replaceMode: true,
           snapshot: {
             storeProfile,
             products: dbProducts,
             deletedBarcodes,
+            orderTabs,
+            activeTabId,
+            currentInvoiceCode,
             invoices: invoices.map((inv) => ({
               id: inv.id,
               invoiceCode: inv.invoiceCode,
@@ -843,7 +939,7 @@ export default function App() {
       }
       await fetchBlobDatabaseState(sessionToken, true);
       setBlobSyncNotice(
-        `Đã cập nhật bản lưu CSDL trên taphoadungcanh-blob (${data.productCount} sản phẩm tùy chỉnh · ${data.invoiceCount} hóa đơn)!`
+        `Đã cập nhật toàn bộ bản lưu lên taphoadungcanh-blob (${data.tabCount || orderTabs.length} phiếu đang mở · ${data.invoiceCount} lịch sử bill · Mã QR & Hàng hóa) — Mở ở bất kỳ đâu cũng giống nhau!`
       );
     } catch (error) {
       setAuthError(
